@@ -15,31 +15,21 @@ const BACKEND_URL =
 const TESLA_CLIENT_ID = process.env.TESLA_CLIENT_ID || "";
 const TESLA_CLIENT_SECRET = process.env.TESLA_CLIENT_SECRET || "";
 
-const TESLA_AUTH_BASE = "https://auth.tesla.com";
-const TESLA_API_BASE = "https://fleet-api.prd.eu.vn.cloud.tesla.com";
-
-const SESSION_SECRET = process.env.SESSION_SECRET || "change-this-secret";
-
-app.use(
-  cors({
-    origin: APP_URL,
-    credentials: true
-  })
-);
+app.use(cors({ origin: true, credentials: true }));
 
 let savedToken = null;
-let pkceStore = {};
+const stateStore = new Map();
 
-function base64url(buffer) {
-  return Buffer.from(buffer)
+function b64url(buf) {
+  return Buffer.from(buf)
     .toString("base64")
     .replace(/\+/g, "-")
     .replace(/\//g, "_")
-    .replace(/=+$/, "");
+    .replace(/=+$/g, "");
 }
 
-function sha256(input) {
-  return base64url(crypto.createHash("sha256").update(input).digest());
+function sha256(text) {
+  return b64url(crypto.createHash("sha256").update(text).digest());
 }
 
 app.get("/", (req, res) => {
@@ -48,43 +38,42 @@ app.get("/", (req, res) => {
 
 app.get("/health", (req, res) => {
   res.json({
-    status: "ok",
-    backend: BACKEND_URL,
-    teslaClientConfigured: !!TESLA_CLIENT_ID
+    ok: true,
+    service: "tesla-v5-railway-backend",
+    teslaClientConfigured: !!TESLA_CLIENT_ID,
+    teslaSecretConfigured: !!TESLA_CLIENT_SECRET,
+    backendUrl: BACKEND_URL
   });
 });
 
-/* Alias */
 app.get("/auth/login", (req, res) => {
   res.redirect("/auth/tesla");
 });
 
-/* Tesla login */
 app.get("/auth/tesla", (req, res) => {
   if (!TESLA_CLIENT_ID) {
     return res.status(500).send("TESLA_CLIENT_ID mangler i Railway Variables");
   }
 
   const state = crypto.randomBytes(16).toString("hex");
-  const verifier = base64url(crypto.randomBytes(64));
+  const verifier = b64url(crypto.randomBytes(64));
   const challenge = sha256(verifier);
 
-  pkceStore[state] = verifier;
+  stateStore.set(state, verifier);
 
   const params = new URLSearchParams({
     client_id: TESLA_CLIENT_ID,
     response_type: "code",
     redirect_uri: `${BACKEND_URL}/auth/callback`,
-    scope: "openid offline_access vehicle_device_data vehicle_location",
+    scope: "openid offline_access vehicle_device_data vehicle_location vehicle_cmds",
     state,
     code_challenge: challenge,
     code_challenge_method: "S256"
   });
 
-  res.redirect(`${TESLA_AUTH_BASE}/oauth2/v3/authorize?${params.toString()}`);
+  res.redirect(`https://auth.tesla.com/oauth2/v3/authorize?${params}`);
 });
 
-/* Tesla callback */
 app.get("/auth/callback", async (req, res) => {
   try {
     const { code, state } = req.query;
@@ -93,12 +82,12 @@ app.get("/auth/callback", async (req, res) => {
       return res.status(400).send("Mangler code/state fra Tesla");
     }
 
-    const verifier = pkceStore[state];
+    const verifier = stateStore.get(String(state));
     if (!verifier) {
-      return res.status(400).send("Ugyldig eller utløpt state");
+      return res.status(400).send("Ugyldig/utløpt state. Start på /auth/tesla igjen.");
     }
 
-    delete pkceStore[state];
+    stateStore.delete(String(state));
 
     const body = new URLSearchParams({
       grant_type: "authorization_code",
@@ -112,41 +101,36 @@ app.get("/auth/callback", async (req, res) => {
       body.set("client_secret", TESLA_CLIENT_SECRET);
     }
 
-    const tokenRes = await fetch(`${TESLA_AUTH_BASE}/oauth2/v3/token`, {
+    const r = await fetch("https://auth.tesla.com/oauth2/v3/token", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded"
-      },
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body
     });
 
-    const tokenData = await tokenRes.json();
+    const data = await r.json();
 
-    if (!tokenRes.ok) {
+    if (!r.ok) {
       return res.status(500).json({
         ok: false,
         error: "Tesla token-feil",
-        details: tokenData
+        details: data
       });
     }
 
     savedToken = {
-      access_token: tokenData.access_token,
-      refresh_token: tokenData.refresh_token,
-      expires_at: Date.now() + (tokenData.expires_in || 3600) * 1000
+      access_token: data.access_token,
+      refresh_token: data.refresh_token,
+      expires_at: Date.now() + (data.expires_in || 3600) * 1000
     };
 
     res.redirect(`${APP_URL}?tesla=connected`);
   } catch (err) {
-    res.status(500).json({
-      ok: false,
-      error: err.message
-    });
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-async function refreshTokenIfNeeded() {
-  if (!savedToken) throw new Error("Tesla er ikke koblet");
+async function getAccessToken() {
+  if (!savedToken) throw new Error("Tesla er ikke koblet enda");
 
   if (Date.now() < savedToken.expires_at - 120000) {
     return savedToken.access_token;
@@ -162,17 +146,15 @@ async function refreshTokenIfNeeded() {
     body.set("client_secret", TESLA_CLIENT_SECRET);
   }
 
-  const res = await fetch(`${TESLA_AUTH_BASE}/oauth2/v3/token`, {
+  const r = await fetch("https://auth.tesla.com/oauth2/v3/token", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded"
-    },
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body
   });
 
-  const data = await res.json();
+  const data = await r.json();
 
-  if (!res.ok) {
+  if (!r.ok) {
     throw new Error("Kunne ikke fornye Tesla-token");
   }
 
@@ -186,57 +168,43 @@ async function refreshTokenIfNeeded() {
 }
 
 async function teslaGet(path) {
-  const token = await refreshTokenIfNeeded();
+  const token = await getAccessToken();
 
-  const res = await fetch(`${TESLA_API_BASE}${path}`, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json"
-    }
+  const r = await fetch(`https://fleet-api.prd.eu.vn.cloud.tesla.com${path}`, {
+    headers: { Authorization: `Bearer ${token}` }
   });
 
-  const data = await res.json();
+  const data = await r.json();
 
-  if (!res.ok) {
+  if (!r.ok) {
     throw new Error(JSON.stringify(data));
   }
 
   return data;
 }
 
-/* Hent biler */
 app.get("/api/vehicles", async (req, res) => {
   try {
     const data = await teslaGet("/api/1/vehicles");
-    res.json({
-      ok: true,
-      vehicles: data.response || []
-    });
+    res.json({ ok: true, vehicles: data.response || [] });
   } catch (err) {
-    res.status(500).json({
-      ok: false,
-      error: err.message
-    });
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-/* Hent Tesla live-data */
 app.get("/api/tesla-live", async (req, res) => {
   try {
     const vehicles = await teslaGet("/api/1/vehicles");
     const vehicle = vehicles.response?.[0];
 
     if (!vehicle) {
-      return res.status(404).json({
-        ok: false,
-        error: "Fant ingen Tesla på kontoen"
-      });
+      return res.status(404).json({ ok: false, error: "Fant ingen bil" });
     }
 
-    const vehicleId = vehicle.id_s || vehicle.id;
+    const id = vehicle.id_s || vehicle.id;
 
     const data = await teslaGet(
-      `/api/1/vehicles/${vehicleId}/vehicle_data?endpoints=charge_state;drive_state;vehicle_state;climate_state`
+      `/api/1/vehicles/${id}/vehicle_data?endpoints=charge_state;drive_state;vehicle_state;climate_state`
     );
 
     const r = data.response || {};
@@ -252,18 +220,17 @@ app.get("/api/tesla-live", async (req, res) => {
       rr: vehicleState.tpms_pressure_rr ?? null
     };
 
-    const tpmsValues = Object.values(tpms).filter(v => typeof v === "number");
-    const tpmsAvgBar =
-      tpmsValues.length > 0
-        ? tpmsValues.reduce((a, b) => a + b, 0) / tpmsValues.length
-        : null;
+    const vals = Object.values(tpms).filter(v => typeof v === "number");
+    const tpmsAvgBar = vals.length
+      ? vals.reduce((a, b) => a + b, 0) / vals.length
+      : null;
 
     res.json({
       ok: true,
       connected: true,
       vehicle: {
-        id: vehicleId,
-        displayName: vehicle.display_name || vehicle.vehicle_name || "Tesla"
+        id,
+        name: vehicle.display_name || vehicle.vehicle_name || "Tesla"
       },
       telemetry: {
         batteryLevel: charge.battery_level ?? null,
@@ -276,31 +243,22 @@ app.get("/api/tesla-live", async (req, res) => {
           : null,
         chargingState: charge.charging_state ?? null,
         chargerPowerKw: charge.charger_power ?? null,
-
         vehicleSpeedKmh: drive.speed ? drive.speed * 1.60934 : null,
         latitude: drive.latitude ?? null,
         longitude: drive.longitude ?? null,
         shiftState: drive.shift_state ?? null,
-
         outsideTemp: climate.outside_temp ?? null,
         insideTemp: climate.inside_temp ?? null,
-
         tpmsAvgBar,
         tpms,
-
         timestamp: new Date().toISOString()
       }
     });
   } catch (err) {
-    res.status(500).json({
-      ok: false,
-      connected: false,
-      error: err.message
-    });
+    res.status(500).json({ ok: false, connected: false, error: err.message });
   }
 });
 
-/* Demo-data */
 app.get("/api/tesla-demo", (req, res) => {
   res.json({
     ok: true,
@@ -317,12 +275,7 @@ app.get("/api/tesla-demo", (req, res) => {
       outsideTemp: 5,
       insideTemp: 21,
       tpmsAvgBar: 2.9,
-      tpms: {
-        fl: 2.9,
-        fr: 2.9,
-        rl: 2.8,
-        rr: 2.9
-      },
+      tpms: { fl: 2.9, fr: 2.9, rl: 2.8, rr: 2.9 },
       chargingState: "Disconnected",
       chargerPowerKw: 0,
       timestamp: new Date().toISOString()
