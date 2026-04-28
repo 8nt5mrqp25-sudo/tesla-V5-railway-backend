@@ -1,5 +1,5 @@
 {
-  "name": "tesla-backend",
+  "name": "tesla-v5-railway-backend",
   "version": "1.0.0",
   "main": "server.js",
   "type": "commonjs",
