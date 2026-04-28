@@ -20,8 +20,12 @@ const APP_URL =
   process.env.APP_URL ||
   "https://teslaoptimizer.netlify.app";
 
+const DOMAIN = "teslaoptimizer.netlify.app";
+
 const TESLA_AUTH = "https://auth.tesla.com";
+const TESLA_PARTNER_AUTH = "https://fleet-auth.prd.vn.cloud.tesla.com";
 const TESLA_API = "https://fleet-api.prd.eu.vn.cloud.tesla.com";
+const TESLA_AUDIENCE = "https://fleet-api.prd.eu.vn.cloud.tesla.com";
 
 let savedToken = null;
 const pkceStore = new Map();
@@ -40,7 +44,6 @@ function sha256(text) {
 
 async function readJsonSafe(response) {
   const raw = await response.text();
-
   try {
     return { json: JSON.parse(raw), raw };
   } catch {
@@ -58,17 +61,13 @@ app.get("/health", (req, res) => {
     client: !!CLIENT_ID,
     secret: !!CLIENT_SECRET,
     backendUrl: BACKEND_URL,
-    appUrl: APP_URL
+    appUrl: APP_URL,
+    domain: DOMAIN
   });
 });
 
-app.get("/auth/login", (req, res) => {
-  res.redirect("/auth/tesla");
-});
-
-app.get("/api/login", (req, res) => {
-  res.redirect("/auth/tesla");
-});
+app.get("/auth/login", (req, res) => res.redirect("/auth/tesla"));
+app.get("/api/login", (req, res) => res.redirect("/auth/tesla"));
 
 app.get("/auth/tesla", (req, res) => {
   if (!CLIENT_ID) {
@@ -103,7 +102,6 @@ app.get("/auth/callback", async (req, res) => {
     }
 
     const verifier = pkceStore.get(String(state));
-
     if (!verifier) {
       return res.status(400).send("Ugyldig/utløpt state. Start på /auth/tesla igjen.");
     }
@@ -113,20 +111,18 @@ app.get("/auth/callback", async (req, res) => {
     const body = new URLSearchParams({
       grant_type: "authorization_code",
       client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,
       code: String(code),
       redirect_uri: `${BACKEND_URL}/auth/callback`,
       code_verifier: verifier
     });
 
-    if (CLIENT_SECRET) {
-      body.set("client_secret", CLIENT_SECRET);
-    }
-
     const r = await fetch(`${TESLA_AUTH}/oauth2/v3/token`, {
       method: "POST",
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
-        Accept: "application/json"
+        Accept: "application/json",
+        "User-Agent": "Mozilla/5.0 TeslaOptimizer/1.0"
       },
       body
     });
@@ -135,10 +131,9 @@ app.get("/auth/callback", async (req, res) => {
 
     if (!json) {
       return res.status(500).send(
-        "Tesla svarte ikke med JSON.<br>" +
-          "Status: " +
+        "Tesla svarte ikke med JSON.<br>Status: " +
           r.status +
-          "<br><br><pre>" +
+          "<br><pre>" +
           raw.slice(0, 1500) +
           "</pre>"
       );
@@ -160,12 +155,40 @@ app.get("/auth/callback", async (req, res) => {
 
     res.redirect(`${APP_URL}?tesla=connected`);
   } catch (err) {
-    res.status(500).json({
-      ok: false,
-      error: err.message
-    });
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
+
+async function getPartnerToken() {
+  const body = new URLSearchParams({
+    grant_type: "client_credentials",
+    client_id: CLIENT_ID,
+    client_secret: CLIENT_SECRET,
+    scope: "openid offline_access vehicle_device_data vehicle_location vehicle_cmds",
+    audience: TESLA_AUDIENCE
+  });
+
+  const r = await fetch(`${TESLA_PARTNER_AUTH}/oauth2/v3/token`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Accept: "application/json"
+    },
+    body
+  });
+
+  const { json, raw } = await readJsonSafe(r);
+
+  if (!json) {
+    throw new Error("Partner-token svarte ikke med JSON: " + raw.slice(0, 800));
+  }
+
+  if (!r.ok) {
+    throw new Error("Partner-token feil: " + JSON.stringify(json));
+  }
+
+  return json.access_token;
+}
 
 async function getAccessToken() {
   if (!savedToken) {
@@ -179,18 +202,16 @@ async function getAccessToken() {
   const body = new URLSearchParams({
     grant_type: "refresh_token",
     client_id: CLIENT_ID,
+    client_secret: CLIENT_SECRET,
     refresh_token: savedToken.refresh_token
   });
-
-  if (CLIENT_SECRET) {
-    body.set("client_secret", CLIENT_SECRET);
-  }
 
   const r = await fetch(`${TESLA_AUTH}/oauth2/v3/token`, {
     method: "POST",
     headers: {
       "Content-Type": "application/x-www-form-urlencoded",
-      Accept: "application/json"
+      Accept: "application/json",
+      "User-Agent": "Mozilla/5.0 TeslaOptimizer/1.0"
     },
     body
   });
@@ -198,7 +219,7 @@ async function getAccessToken() {
   const { json, raw } = await readJsonSafe(r);
 
   if (!json) {
-    throw new Error("Tesla svarte ikke med JSON: " + raw.slice(0, 500));
+    throw new Error("Tesla svarte ikke med JSON: " + raw.slice(0, 800));
   }
 
   if (!r.ok) {
@@ -227,7 +248,7 @@ async function teslaGet(path) {
   const { json, raw } = await readJsonSafe(r);
 
   if (!json) {
-    throw new Error("Tesla API svarte ikke med JSON: " + raw.slice(0, 500));
+    throw new Error("Tesla API svarte ikke med JSON: " + raw.slice(0, 800));
   }
 
   if (!r.ok) {
@@ -239,18 +260,16 @@ async function teslaGet(path) {
 
 app.get("/api/register-partner", async (req, res) => {
   try {
-    const token = await getAccessToken();
+    const partnerToken = await getPartnerToken();
 
     const r = await fetch(`${TESLA_API}/api/1/partner_accounts`, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${token}`,
+        Authorization: `Bearer ${partnerToken}`,
         "Content-Type": "application/json",
         Accept: "application/json"
       },
-      body: JSON.stringify({
-        domain: "teslaoptimizer.netlify.app"
-      })
+      body: JSON.stringify({ domain: DOMAIN })
     });
 
     const { json, raw } = await readJsonSafe(r);
@@ -271,26 +290,16 @@ app.get("/api/register-partner", async (req, res) => {
       response: json
     });
   } catch (err) {
-    res.status(500).json({
-      ok: false,
-      error: err.message
-    });
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
 app.get("/api/vehicles", async (req, res) => {
   try {
     const data = await teslaGet("/api/1/vehicles");
-
-    res.json({
-      ok: true,
-      vehicles: data.response || []
-    });
+    res.json({ ok: true, vehicles: data.response || [] });
   } catch (err) {
-    res.status(500).json({
-      ok: false,
-      error: err.message
-    });
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
@@ -385,12 +394,7 @@ app.get("/api/tesla-demo", (req, res) => {
       outsideTemp: 5,
       insideTemp: 21,
       tpmsAvgBar: 2.9,
-      tpms: {
-        fl: 2.9,
-        fr: 2.9,
-        rl: 2.8,
-        rr: 2.9
-      },
+      tpms: { fl: 2.9, fr: 2.9, rl: 2.8, rr: 2.9 },
       chargingState: "Disconnected",
       chargerPowerKw: 0,
       timestamp: new Date().toISOString()
