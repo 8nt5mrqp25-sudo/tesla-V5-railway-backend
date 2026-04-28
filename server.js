@@ -12,8 +12,8 @@ const BACKEND_URL =
   process.env.BACKEND_URL ||
   "https://tesla-v5-railway-backend-production.up.railway.app";
 
-const TESLA_CLIENT_ID = process.env.TESLA_CLIENT_ID || "";
-const TESLA_CLIENT_SECRET = process.env.TESLA_CLIENT_SECRET || "";
+const TESLA_CLIENT_ID = process.env.TESLA_CLIENT_ID || "ta-secret.GFy08CxyTQup09hJ";
+const TESLA_CLIENT_SECRET = process.env.TESLA_CLIENT_SECRET || "ta-secret.GFy08CxyTQup09hJ";
 
 const TESLA_AUTH_BASE = "https://auth.tesla.com";
 const TESLA_API_BASE = "https://fleet-api.prd.eu.vn.cloud.tesla.com";
