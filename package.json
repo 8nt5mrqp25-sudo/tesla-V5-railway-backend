@@ -1,6 +1,6 @@
 {
-  "name": "tesla-v3-2-fix-backend",
-  "version": "3.2.0",
+  "name": "tesla-v1-clean-backend",
+  "version": "1.0.0",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
