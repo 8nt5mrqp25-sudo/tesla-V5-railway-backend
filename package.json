@@ -1,1 +1,14 @@
-{"name":"tesla-v1-1-clean-fix-backend","version":"1.1.0","main":"server.js","type":"commonjs","scripts":{"start":"node server.js"},"dependencies":{"express":"^4.18.2","cors":"^2.8.5","node-fetch":"^2.6.7"}}
+{
+  "name": "tesla-v2-intelligence-backend",
+  "version": "2.0.0",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "node-fetch": "^2.6.7"
+  }
+}
