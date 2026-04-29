@@ -1,6 +1,6 @@
 {
-  "name": "tesla-v2-7-diagnose-backend",
-  "version": "2.7.0",
+  "name": "tesla-v3-pro-backend",
+  "version": "3.0.0",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
