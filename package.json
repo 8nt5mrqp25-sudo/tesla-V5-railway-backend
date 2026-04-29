@@ -1,6 +1,6 @@
 {
-  "name": "tesla-v3-pro-backend",
-  "version": "3.0.0",
+  "name": "tesla-v3-1-mobile-maps-backend",
+  "version": "3.1.0",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
