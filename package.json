@@ -1,6 +1,6 @@
 {
-  "name": "tesla-turoptimal-v2-4-backend",
-  "version": "2.4.0",
+  "name": "tesla-v2-7-diagnose-backend",
+  "version": "2.7.0",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
