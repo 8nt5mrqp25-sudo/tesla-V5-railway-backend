@@ -1,23 +1,17 @@
-
 const express=require("express"),cors=require("cors"),crypto=require("crypto"),fetch=require("node-fetch");
 const app=express(); app.use(express.json({limit:"4mb"})); app.use(cors({origin:true}));
-
 const PORT=process.env.PORT||8080;
 const CLIENT_ID=(process.env.TESLA_CLIENT_ID||"").trim();
 const CLIENT_SECRET=(process.env.TESLA_CLIENT_SECRET||"").trim();
 const GOOGLE_API_KEY=(process.env.GOOGLE_API_KEY||"").trim();
 const BACKEND_URL=(process.env.BACKEND_URL||"https://diplomatic-charisma-production-3e63.up.railway.app").trim();
 const APP_URL=(process.env.APP_URL||"https://teslaoptimizer.netlify.app").trim();
-
 const TESLA_AUTH="https://auth.tesla.com";
 const TESLA_API="https://fleet-api.prd.eu.vn.cloud.tesla.com";
-
 let savedToken=null; const pkceStore=new Map();
-
 function b64(b){return Buffer.from(b).toString("base64").replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/g,"")}
 function sha256(t){return b64(crypto.createHash("sha256").update(t).digest())}
 async function safeJson(r){const raw=await r.text();try{return{json:JSON.parse(raw),raw}}catch{return{json:null,raw}}}
-
 app.get("/",(req,res)=>res.send("Tesla TurOptimal V2.1 Intelligence Route-Charging backend"));
 app.get("/health",(req,res)=>res.json({
   ok:true,version:"2.1-route-charging",client:!!CLIENT_ID,secret:!!CLIENT_SECRET,google:!!GOOGLE_API_KEY,
@@ -25,7 +19,6 @@ app.get("/health",(req,res)=>res.json({
   endpoints:["/auth/tesla","/api/tesla-live","/api/address-suggest","/api/route-intelligence","/api/google-key"]
 }));
 app.get("/api/google-key",(req,res)=>res.json({ok:true,key:GOOGLE_API_KEY||""}));
-
 app.get("/auth/login",(req,res)=>res.redirect("/auth/tesla"));
 app.get("/api/login",(req,res)=>res.redirect("/auth/tesla"));
 app.get("/auth/tesla",(req,res)=>{
@@ -74,7 +67,6 @@ app.post("/api/wake",async(req,res)=>{
  try{const v=await firstVehicle(),id=v.id_s||v.id,d=await teslaFetch(`/api/1/vehicles/${id}/wake_up`,{method:"POST"});res.json({ok:true,vehicle:{id,name:v.display_name||v.vehicle_name||"Tesla"},response:d.response||d})}
  catch(e){res.status(500).json({ok:false,error:e.message})}
 });
-
 app.get("/api/tesla-live",async(req,res)=>{
  try{
   const v=await firstVehicle(),id=v.id_s||v.id,d=await teslaFetch(`/api/1/vehicles/${id}/vehicle_data`),r=d.response||{},c=r.charge_state||{},dr=r.drive_state||{},vs=r.vehicle_state||{},cl=r.climate_state||{},cfg=r.vehicle_config||{};
@@ -85,7 +77,6 @@ app.get("/api/tesla-live",async(req,res)=>{
  }catch(e){res.status(500).json({ok:false,connected:false,error:e.message})}
 });
 app.get("/api/tesla-live-dashboard",(req,res)=>{req.url="/api/tesla-live";app._router.handle(req,res)});
-
 app.get("/api/address-suggest",async(req,res)=>{
  try{
   if(!GOOGLE_API_KEY)throw new Error("GOOGLE_API_KEY mangler");
@@ -97,7 +88,6 @@ app.get("/api/address-suggest",async(req,res)=>{
   res.json({ok:true,predictions:(d.predictions||[]).slice(0,8).map(x=>({description:x.description,place_id:x.place_id,main:x.structured_formatting?.main_text||x.description,secondary:x.structured_formatting?.secondary_text||""}))});
  }catch(e){res.status(500).json({ok:false,error:e.message})}
 });
-
 async function geocode(address){
  const r=await fetch("https://maps.googleapis.com/maps/api/geocode/json?"+new URLSearchParams({address,key:GOOGLE_API_KEY}));
  const d=await r.json();
@@ -166,7 +156,6 @@ function makeChargingStops({segments,mapPoints,totalKm,batteryKwh,startSoc,minAr
  });
  return {needed:stops.length>0,stops,totalChargeMinutes:stops.reduce((s,x)=>s+x.chargeMinutes,0),arrivalSoc:Math.round(soc),routeStopsWithCharging:routeStops,comment:stops.length?"Ladestopp er lagt inn som ekte stopp i ruten. Tesla Supercharger prioriteres først.":"Ingen lading nødvendig med valgt buffer."};
 }
-
 app.post("/api/route-intelligence",async(req,res)=>{
  try{
   const stops=(req.body.stops||[]).filter(Boolean).slice(0,20),params=req.body.params||{},tesla=req.body.tesla||{};
