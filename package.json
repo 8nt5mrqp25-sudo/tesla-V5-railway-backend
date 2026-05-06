@@ -1,6 +1,7 @@
+
 {
-  "name": "tesla-v3-ekte-turassistent-backend",
-  "version": "3.0.0",
+  "name": "tesla-v4-ai-route-energy-engine-backend",
+  "version": "4.0.0",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
