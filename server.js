@@ -1,47 +1,314 @@
-const express=require('express');
-const cors=require('cors');
-const crypto=require('crypto');
-const fetch=require('node-fetch');
-const app=express();
-app.use(express.json({limit:'5mb'}));
-app.use(cors({origin:true}));
-const PORT=process.env.PORT||8080;
-const TESLA_CLIENT_ID=(process.env.TESLA_CLIENT_ID||'').trim();
-const TESLA_CLIENT_SECRET=(process.env.TESLA_CLIENT_SECRET||'').trim();
-const GOOGLE_API_KEY=(process.env.GOOGLE_API_KEY||'').trim();
-const BACKEND_URL=(process.env.BACKEND_URL||'https://diplomatic-charisma-production-3e63.up.railway.app').trim();
-const APP_URL=(process.env.APP_URL||'https://teslaoptimizer.netlify.app').trim();
-const TESLA_AUTH='https://auth.tesla.com';
-const TESLA_API='https://fleet-api.prd.eu.vn.cloud.tesla.com';
-let savedToken=null; const pkceStore=new Map();
-function b64(b){return Buffer.from(b).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/g,'')}
-function sha256(s){return b64(crypto.createHash('sha256').update(s).digest())}
-async function safeJson(r){const raw=await r.text();try{return{json:JSON.parse(raw),raw}}catch{return{json:null,raw}}}
-function num(v,f=null){const n=Number(v);return Number.isFinite(n)?n:f}
-function kmhFromMph(mph){return mph==null?null:mph*1.60934}
-function navUrl(stops){if(!stops||stops.length<2)return'#';const o=encodeURIComponent(stops[0]),d=encodeURIComponent(stops[stops.length-1]),w=stops.slice(1,-1).map(encodeURIComponent).join('|');return `https://www.google.com/maps/dir/?api=1&origin=${o}&destination=${d}&travelmode=driving${w?'&waypoints='+w:''}`}
-function mapUrl(stops){return 'https://www.google.com/maps?output=embed&q='+encodeURIComponent((stops||[]).join(' to '))}
-function homeAlias(a){return String(a||'').trim().toLowerCase()==='hjemme'?'Løvsjø terrasse 13, Porsgrunn, Norge':a}
-app.get('/',(req,res)=>res.send('Tesla TurOptimal V4.1 FIXED backend'));
-app.get('/health',(req,res)=>res.json({ok:true,version:'4.1-fixed-all-files',client:!!TESLA_CLIENT_ID,secret:!!TESLA_CLIENT_SECRET,google:!!GOOGLE_API_KEY,backendUrl:BACKEND_URL,appUrl:APP_URL,endpoints:['/auth/tesla','/api/tesla-live','/api/wake','/api/address-suggest','/api/google-key','/api/test-google','/api/plan-trip-v4']}));
-app.get('/api/google-key',(req,res)=>res.json({ok:true,google:!!GOOGLE_API_KEY,keyPrefix:GOOGLE_API_KEY?GOOGLE_API_KEY.slice(0,8)+'...':null}));
-app.get('/api/test-google',async(req,res)=>{try{if(!GOOGLE_API_KEY)throw new Error('GOOGLE_API_KEY mangler i Railway');const input=String(req.query.input||'Kongsberg');const r=await fetch('https://maps.googleapis.com/maps/api/place/autocomplete/json?'+new URLSearchParams({input,key:GOOGLE_API_KEY,language:'no',components:'country:no'}));const d=await r.json();res.json({ok:d.status==='OK'||d.status==='ZERO_RESULTS',googleStatus:d.status,errorMessage:d.error_message||null,count:(d.predictions||[]).length,examples:(d.predictions||[]).slice(0,5).map(p=>p.description)})}catch(e){res.status(500).json({ok:false,error:e.message})}});
-app.get('/auth/login',(req,res)=>res.redirect('/auth/tesla'));
-app.get('/api/login',(req,res)=>res.redirect('/auth/tesla'));
-app.get('/auth/tesla',(req,res)=>{if(!TESLA_CLIENT_ID)return res.status(500).send('TESLA_CLIENT_ID mangler');const state=crypto.randomBytes(16).toString('hex'),ver=b64(crypto.randomBytes(64)),ch=sha256(ver);pkceStore.set(state,ver);const p=new URLSearchParams({client_id:TESLA_CLIENT_ID,response_type:'code',redirect_uri:`${BACKEND_URL}/auth/callback`,scope:'openid offline_access vehicle_device_data vehicle_location vehicle_cmds',state,code_challenge:ch,code_challenge_method:'S256'});res.redirect(`${TESLA_AUTH}/oauth2/v3/authorize?${p}`)});
-app.get('/auth/callback',async(req,res)=>{try{const{code,state}=req.query;const ver=pkceStore.get(String(state||''));if(!code||!ver)return res.status(400).send('Mangler code/state. Start /auth/tesla igjen.');pkceStore.delete(String(state));const body=new URLSearchParams({grant_type:'authorization_code',client_id:TESLA_CLIENT_ID,client_secret:TESLA_CLIENT_SECRET,code:String(code),redirect_uri:`${BACKEND_URL}/auth/callback`,code_verifier:ver});const r=await fetch(`${TESLA_AUTH}/oauth2/v3/token`,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded',Accept:'application/json','User-Agent':'TeslaTurOptimal/4.1'},body});const{json,raw}=await safeJson(r);if(!json)return res.status(500).send(raw.slice(0,1200));if(!r.ok)return res.status(500).json({ok:false,error:'Tesla token-feil',details:json});savedToken={access_token:json.access_token,refresh_token:json.refresh_token,expires_at:Date.now()+(json.expires_in||3600)*1000};res.redirect(`${APP_URL}?tesla=connected`)}catch(e){res.status(500).json({ok:false,error:e.message})}});
-async function getTeslaToken(){if(!savedToken)throw new Error('Tesla er ikke koblet. Åpne /auth/tesla først.');if(Date.now()<savedToken.expires_at-120000)return savedToken.access_token;const body=new URLSearchParams({grant_type:'refresh_token',client_id:TESLA_CLIENT_ID,client_secret:TESLA_CLIENT_SECRET,refresh_token:savedToken.refresh_token});const r=await fetch(`${TESLA_AUTH}/oauth2/v3/token`,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded',Accept:'application/json','User-Agent':'TeslaTurOptimal/4.1'},body});const{json,raw}=await safeJson(r);if(!json)throw new Error(raw.slice(0,900));if(!r.ok)throw new Error(JSON.stringify(json));savedToken={access_token:json.access_token,refresh_token:json.refresh_token||savedToken.refresh_token,expires_at:Date.now()+(json.expires_in||3600)*1000};return savedToken.access_token}
-async function teslaFetch(path,opt={}){const token=await getTeslaToken();const r=await fetch(`${TESLA_API}${path}`,{...opt,headers:{Authorization:`Bearer ${token}`,Accept:'application/json','Content-Type':'application/json',...(opt.headers||{})}});const{json,raw}=await safeJson(r);if(!json)throw new Error(raw.slice(0,900));if(!r.ok)throw new Error(JSON.stringify(json));return json}
-async function firstVehicle(){const d=await teslaFetch('/api/1/vehicles');const v=d.response&&d.response[0];if(!v)throw new Error('Fant ingen Tesla');return v}
-app.post('/api/wake',async(req,res)=>{try{const v=await firstVehicle(),id=v.id_s||v.id;const d=await teslaFetch(`/api/1/vehicles/${id}/wake_up`,{method:'POST'});res.json({ok:true,response:d.response||d})}catch(e){res.status(500).json({ok:false,error:e.message})}});
-app.get('/api/tesla-live',async(req,res)=>{try{const v=await firstVehicle(),id=v.id_s||v.id,d=await teslaFetch(`/api/1/vehicles/${id}/vehicle_data`),r=d.response||{},c=r.charge_state||{},dr=r.drive_state||{},vs=r.vehicle_state||{},cl=r.climate_state||{},cfg=r.vehicle_config||{};const tpms={fl:vs.tpms_pressure_fl??null,fr:vs.tpms_pressure_fr??null,rl:vs.tpms_pressure_rl??null,rr:vs.tpms_pressure_rr??null};const vals=Object.values(tpms).filter(x=>typeof x==='number');res.json({ok:true,connected:true,vehicle:{id,name:v.display_name||vs.vehicle_name||'Tesla',state:v.state||null,carVersion:vs.car_version||null,carType:cfg.car_type||null,wheelType:cfg.wheel_type||null,odometerKm:vs.odometer?vs.odometer*1.60934:null},telemetry:{batteryLevel:c.battery_level??null,usableBatteryLevel:c.usable_battery_level??null,chargeLimitSoc:c.charge_limit_soc??null,idealRangeKm:c.ideal_battery_range?c.ideal_battery_range*1.60934:null,ratedRangeKm:c.battery_range?c.battery_range*1.60934:null,chargingState:c.charging_state??null,chargerPowerKw:c.charger_power??null,speedKmh:kmhFromMph(dr.speed),powerKw:dr.power??null,latitude:dr.latitude??null,longitude:dr.longitude??null,shiftState:dr.shift_state??null,outsideTemp:cl.outside_temp??null,insideTemp:cl.inside_temp??null,climateOn:cl.is_climate_on??null,tpmsAvgBar:vals.length?vals.reduce((a,b)=>a+b,0)/vals.length:null,tpms,tpmsRecommended:{front:vs.tpms_rcp_front_value??null,rear:vs.tpms_rcp_rear_value??null},timestamp:new Date().toISOString()}})}catch(e){res.status(500).json({ok:false,connected:false,error:e.message})}});
-app.get('/api/address-suggest',async(req,res)=>{try{if(!GOOGLE_API_KEY)throw new Error('GOOGLE_API_KEY mangler i Railway');const input=String(req.query.input||'').trim();if(input.length<2)return res.json({ok:true,predictions:[]});const r=await fetch('https://maps.googleapis.com/maps/api/place/autocomplete/json?'+new URLSearchParams({input,key:GOOGLE_API_KEY,language:'no',components:'country:no'}));const d=await r.json();if(d.status!=='OK'&&d.status!=='ZERO_RESULTS')return res.status(500).json({ok:false,googleStatus:d.status,error:d.error_message||'Autocomplete feilet'});res.json({ok:true,googleStatus:d.status,predictions:(d.predictions||[]).slice(0,8).map(x=>({description:x.description,main:x.structured_formatting?.main_text||x.description,secondary:x.structured_formatting?.secondary_text||''}))})}catch(e){res.status(500).json({ok:false,error:e.message})}});
-async function geocode(address){const q=homeAlias(address);const r=await fetch('https://maps.googleapis.com/maps/api/geocode/json?'+new URLSearchParams({address:q,key:GOOGLE_API_KEY,language:'no',region:'no'}));const d=await r.json();if(d.status!=='OK'||!d.results?.[0])throw new Error(`Fant ikke adresse: ${address} (${d.status}${d.error_message?': '+d.error_message:''})`);const loc=d.results[0].geometry.location;return{input:address,formatted:d.results[0].formatted_address,lat:loc.lat,lng:loc.lng}}
-async function route(points){const origin={location:{latLng:{latitude:points[0].lat,longitude:points[0].lng}}},destination={location:{latLng:{latitude:points.at(-1).lat,longitude:points.at(-1).lng}}},intermediates=points.slice(1,-1).map(p=>({location:{latLng:{latitude:p.lat,longitude:p.lng}}}));const body={origin,destination,intermediates,travelMode:'DRIVE',routingPreference:'TRAFFIC_UNAWARE'};const r=await fetch('https://routes.googleapis.com/directions/v2:computeRoutes',{method:'POST',headers:{'Content-Type':'application/json','X-Goog-Api-Key':GOOGLE_API_KEY,'X-Goog-FieldMask':'routes.legs.distanceMeters,routes.legs.duration'},body:JSON.stringify(body)});const d=await r.json();if(!r.ok||!d.routes?.[0])throw new Error('Google Routes feilet: '+JSON.stringify(d).slice(0,900));return d.routes[0]}
-async function yr(lat,lng){try{const r=await fetch(`https://api.met.no/weatherapi/locationforecast/2.0/compact?lat=${lat.toFixed(4)}&lon=${lng.toFixed(4)}`,{headers:{'User-Agent':'TeslaTurOptimal/4.1 age.sonstebo@me.com'}});const d=await r.json();const det=d.properties?.timeseries?.[0]?.data?.instant?.details||{},next=d.properties?.timeseries?.[0]?.data?.next_1_hours?.details||{};return{temperature:det.air_temperature??null,windSpeed:det.wind_speed??null,windDir:det.wind_from_direction??null,rain:next.precipitation_amount??0}}catch{return{temperature:null,windSpeed:null,windDir:null,rain:0}}}
-function chargerName(km,stops){const h=stops.join(' ').toLowerCase();if(h.includes('røldal')||h.includes('roldal'))return'Tesla Supercharger Røldal';if(h.includes('eidfjord'))return'Tesla Supercharger Eidfjord';if(h.includes('seljord'))return'Tesla Supercharger Seljord';if(h.includes('geilo'))return'Tesla Supercharger Geilo';if(h.includes('kongsberg'))return'Tesla Supercharger Kongsberg';return`Tesla Supercharger nær ${Math.round(km)} km`}
-function estimateWhKm(base,weather,params,tpmsAvg,wheelType){let f=1,reasons=[];if(num(weather.temperature,10)<5){f*=1.10;reasons.push('kulde')}if(num(weather.rain,0)>0.2){f*=1.07;reasons.push('regn')}if(num(weather.windSpeed,0)>8){f*=1.08;reasons.push('vind')}if(tpmsAvg!=null&&tpmsAvg<2.8){f*=1.05;reasons.push('dekktrykk')}if(params.luggage==='tung'){f*=1.035;reasons.push('bagasje')}if(params.speedMode==='rask'){f*=1.10;reasons.push('fart')}if(params.speedMode==='rolig'){f*=0.94;reasons.push('rolig')}if(String(wheelType||'').toLowerCase().includes('20'))f*=1.025;return{whKm:base*f,reasons}}
-app.post('/api/plan-trip-v4',async(req,res)=>{try{if(!GOOGLE_API_KEY)throw new Error('GOOGLE_API_KEY mangler i Railway');const stops=(req.body.stops||[]).map(x=>String(x||'').trim()).filter(Boolean).slice(0,20);if(stops.length<2)return res.status(400).json({ok:false,error:'Minst to stopp kreves'});const params=req.body.params||{},tesla=req.body.tesla||{},tt=tesla.telemetry||{},tv=tesla.vehicle||{};const points=[];for(const s of stops)points.push(await geocode(s));const rt=await route(points);const legKm=(rt.legs||[]).map(l=>(l.distanceMeters||0)/1000),legMin=(rt.legs||[]).map(l=>(parseInt(String(l.duration||'0s').replace('s',''),10)||0)/60);const totalKm=legKm.reduce((a,b)=>a+b,0),driveMinutes=legMin.reduce((a,b)=>a+b,0);const batteryKwh=num(params.batteryKwh,74),baseWhKm=num(params.baseWhKm,155),minSoc=num(params.minArrivalSoc,15),startSoc=num(tt.usableBatteryLevel,num(tt.batteryLevel,80)),tpmsAvg=num(tt.tpmsAvgBar,null);let soc=startSoc,totalKwh=0,chargeMinutes=0,kmCursor=0;const legs=[],chargers=[],timeline=[{type:'stop',label:stops[0],km:0,soc:Math.round(soc)}],routeStops=[stops[0]],socTrace=[];for(let i=0;i<legKm.length;i++){const a=points[i],b=points[i+1],mid={lat:(a.lat+b.lat)/2,lng:(a.lng+b.lng)/2},weather=await yr(mid.lat,mid.lng);const ew=estimateWhKm(baseWhKm,weather,params,tpmsAvg,tv.wheelType);const kwh=legKm[i]*ew.whKm/1000;const needSoc=kwh/batteryKwh*100;if(soc-needSoc<minSoc){const name=chargerName(kmCursor,stops),target=Math.min(75,Math.max(55,Math.ceil(soc+28)));const cm=Math.max(10,Math.ceil((target-soc)*batteryKwh/100/95*60+3));chargers.push({index:chargers.length+1,name,query:name,afterKm:Math.round(kmCursor),arriveSoc:Math.round(soc),chargeToSoc:target,chargeMinutes:cm,comment:'Ladestopp satt inn for å holde sikker batterimargin.'});timeline.push({type:'charge',label:name,km:Math.round(kmCursor),soc:Math.round(soc),charge:chargers[chargers.length-1]});routeStops.push(name);chargeMinutes+=cm;soc=target}soc-=needSoc;kmCursor+=legKm[i];totalKwh+=kwh;socTrace.push({km:Math.round(kmCursor),soc:Math.round(soc)});legs.push({index:i+1,from:stops[i],to:stops[i+1],km:legKm[i],minutes:legMin[i],kwh,whKm:ew.whKm,weather,reasons:ew.reasons,windType:num(weather.windSpeed,0)>8?'vind':'normal'});timeline.push({type:'stop',label:stops[i+1],km:Math.round(kmCursor),soc:Math.round(soc)});routeStops.push(stops[i+1])}const recommendations=[];if(tpmsAvg!=null&&tpmsAvg<2.8)recommendations.push('Fyll luft før langtur – lavt dekktrykk øker forbruket.');if(legs.some(l=>l.reasons.includes('vind')))recommendations.push('Vind langs ruten – roligere fart gir bedre margin.');const risk=soc<minSoc+5?'Lav margin':chargers.length?'Planlagt trygg margin':'God margin';res.json({ok:true,plan:{version:'4.1-fixed-all-files',inputStops:stops,resolvedStops:points.map(p=>p.formatted),routeStopsWithCharging:routeStops,googleNavUrl:navUrl(routeStops),mapEmbedUrl:mapUrl(routeStops),totalKm,driveMinutes,chargeMinutes,tripMinutes:driveMinutes+chargeMinutes,startSoc,arrivalSoc:Math.round(soc),totalKwh,baseKwh:totalKm*baseWhKm/1000,weatherKwh:Math.max(0,totalKwh-totalKm*baseWhKm/1000),climbKwh:0,regenKwh:0,elevationUp:0,elevationDown:0,chargers,timeline,legs,socTrace,risk,recommendations,factors:{baseWhKm,batteryKwh,minSoc,passengers:num(params.passengers,2),luggage:params.luggage||'normal',speedMode:params.speedMode||'normal',tpmsAvg,wheelType:tv.wheelType||''},summary:chargers.length?'V4.1 har beregnet ladestopp og lagt dem inn som egne stopp i reiseruten.':'V4.1 beregner at ruten kan kjøres uten planlagt lading med valgt margin.'}})}catch(e){res.status(500).json({ok:false,error:e.message})}});
-app.post('/api/plan-trip-v3',(req,res)=>{req.url='/api/plan-trip-v4';app._router.handle(req,res)});
-app.post('/api/route-intelligence',(req,res)=>{req.url='/api/plan-trip-v4';app._router.handle(req,res)});
-app.listen(PORT,()=>console.log('Tesla TurOptimal V4.1 FIXED on port '+PORT));
+const express = require("express");
+const cors = require("cors");
+const crypto = require("crypto");
+const fetch = require("node-fetch");
+const app = express();
+app.use(express.json({ limit: "5mb" }));
+app.use(cors({ origin: true }));
+const PORT = process.env.PORT || 8080;
+const TESLA_CLIENT_ID = (process.env.TESLA_CLIENT_ID || "").trim();
+const TESLA_CLIENT_SECRET = (process.env.TESLA_CLIENT_SECRET || "").trim();
+const GOOGLE_API_KEY = (process.env.GOOGLE_API_KEY || "").trim();
+const BACKEND_URL = (process.env.BACKEND_URL || "https://tesla-v5-railway-backend-production.up.railway.app").trim();
+const APP_URL = (process.env.APP_URL || "https://teslaoptimizer.netlify.app").trim();
+const TESLA_AUTH = "https://auth.tesla.com";
+const TESLA_API = "https://fleet-api.prd.eu.vn.cloud.tesla.com";
+let savedToken = null;
+const pkceStore = new Map();
+function b64(buf) {
+  return Buffer.from(buf).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+function sha256(txt) {
+  return b64(crypto.createHash("sha256").update(txt).digest());
+}
+async function safeJson(resp) {
+  const raw = await resp.text();
+  try { return { json: JSON.parse(raw), raw }; }
+  catch { return { json: null, raw }; }
+}
+
+
+app.get("/", (req, res) => res.send("Tesla TurOptimal V5 FULL WORKING backend"));
+
+
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    version: "5.0-full-working-map-chargers",
+    client: !!TESLA_CLIENT_ID,
+    secret: !!TESLA_CLIENT_SECRET,
+    google: !!GOOGLE_API_KEY,
+    backendUrl: BACKEND_URL,
+    appUrl: APP_URL,
+    endpoints: [
+      "/auth/tesla",
+      "/api/tesla-live",
+      "/api/wake",
+      "/api/google-key",
+      "/api/test-google"
+    ]
+  });
+});
+
+
+app.get("/api/google-key", (req, res) => {
+  res.json({
+    ok: !!GOOGLE_API_KEY,
+    key: GOOGLE_API_KEY || null,
+    keyPrefix: GOOGLE_API_KEY ? GOOGLE_API_KEY.slice(0, 8) + "..." : null
+  });
+});
+
+
+app.get("/api/test-google", async (req, res) => {
+  try {
+    if (!GOOGLE_API_KEY) throw new Error("GOOGLE_API_KEY mangler i Railway");
+    const input = String(req.query.input || "Kongsberg").trim();
+
+
+    const url = "https://maps.googleapis.com/maps/api/place/autocomplete/json?" +
+      new URLSearchParams({ input, key: GOOGLE_API_KEY, language: "no", components: "country:no" });
+
+
+    const r = await fetch(url);
+    const data = await r.json();
+
+
+    res.json({
+      ok: data.status === "OK" || data.status === "ZERO_RESULTS",
+      googleStatus: data.status,
+      errorMessage: data.error_message || null,
+      count: (data.predictions || []).length,
+      examples: (data.predictions || []).slice(0, 5).map(p => p.description)
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+
+app.get("/auth/login", (req, res) => res.redirect("/auth/tesla"));
+app.get("/api/login", (req, res) => res.redirect("/auth/tesla"));
+
+
+app.get("/auth/tesla", (req, res) => {
+  if (!TESLA_CLIENT_ID) return res.status(500).send("TESLA_CLIENT_ID mangler i Railway Variables");
+
+
+  const state = crypto.randomBytes(16).toString("hex");
+  const verifier = b64(crypto.randomBytes(64));
+  const challenge = sha256(verifier);
+  pkceStore.set(state, verifier);
+
+
+  const params = new URLSearchParams({
+    client_id: TESLA_CLIENT_ID,
+    response_type: "code",
+    redirect_uri: `${BACKEND_URL}/auth/callback`,
+    scope: "openid offline_access vehicle_device_data vehicle_location vehicle_cmds",
+    state,
+    code_challenge: challenge,
+    code_challenge_method: "S256"
+  });
+
+
+  res.redirect(`${TESLA_AUTH}/oauth2/v3/authorize?${params.toString()}`);
+});
+
+
+app.get("/auth/callback", async (req, res) => {
+  try {
+    const { code, state } = req.query;
+    const verifier = pkceStore.get(String(state || ""));
+    if (!code || !verifier) return res.status(400).send("Mangler code eller utløpt state. Start /auth/tesla igjen.");
+    pkceStore.delete(String(state));
+
+
+    const body = new URLSearchParams({
+      grant_type: "authorization_code",
+      client_id: TESLA_CLIENT_ID,
+      client_secret: TESLA_CLIENT_SECRET,
+      code: String(code),
+      redirect_uri: `${BACKEND_URL}/auth/callback`,
+      code_verifier: verifier
+    });
+
+
+    const r = await fetch(`${TESLA_AUTH}/oauth2/v3/token`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Accept: "application/json",
+        "User-Agent": "TeslaTurOptimal/5.0"
+      },
+      body
+    });
+
+
+    const { json, raw } = await safeJson(r);
+    if (!json) return res.status(500).send(raw.slice(0, 1200));
+    if (!r.ok) return res.status(500).json({ ok: false, error: "Tesla token-feil", details: json });
+
+
+    savedToken = {
+      access_token: json.access_token,
+      refresh_token: json.refresh_token,
+      expires_at: Date.now() + (json.expires_in || 3600) * 1000
+    };
+
+
+    res.redirect(`${APP_URL}?tesla=connected`);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+
+async function getTeslaToken() {
+  if (!savedToken) throw new Error("Tesla er ikke koblet. Åpne /auth/tesla først.");
+
+
+  if (Date.now() < savedToken.expires_at - 120000) return savedToken.access_token;
+
+
+  const body = new URLSearchParams({
+    grant_type: "refresh_token",
+    client_id: TESLA_CLIENT_ID,
+    client_secret: TESLA_CLIENT_SECRET,
+    refresh_token: savedToken.refresh_token
+  });
+
+
+  const r = await fetch(`${TESLA_AUTH}/oauth2/v3/token`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Accept: "application/json",
+      "User-Agent": "TeslaTurOptimal/5.0"
+    },
+    body
+  });
+
+
+  const { json, raw } = await safeJson(r);
+  if (!json) throw new Error(raw.slice(0, 900));
+  if (!r.ok) throw new Error(JSON.stringify(json));
+
+
+  savedToken = {
+    access_token: json.access_token,
+    refresh_token: json.refresh_token || savedToken.refresh_token,
+    expires_at: Date.now() + (json.expires_in || 3600) * 1000
+  };
+
+
+  return savedToken.access_token;
+}
+
+
+async function teslaFetch(path, opt = {}) {
+  const token = await getTeslaToken();
+  const r = await fetch(`${TESLA_API}${path}`, {
+    ...opt,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      ...(opt.headers || {})
+    }
+  });
+
+
+  const { json, raw } = await safeJson(r);
+  if (!json) throw new Error(raw.slice(0, 900));
+  if (!r.ok) throw new Error(JSON.stringify(json));
+  return json;
+}
+
+
+async function firstVehicle() {
+  const d = await teslaFetch("/api/1/vehicles");
+  const v = d.response && d.response[0];
+  if (!v) throw new Error("Fant ingen Tesla");
+  return v;
+}
+
+
+app.post("/api/wake", async (req, res) => {
+  try {
+    const v = await firstVehicle();
+    const id = v.id_s || v.id;
+    const d = await teslaFetch(`/api/1/vehicles/${id}/wake_up`, { method: "POST" });
+    res.json({ ok: true, response: d.response || d });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+
+app.get("/api/tesla-live", async (req, res) => {
+  try {
+    const v = await firstVehicle();
+    const id = v.id_s || v.id;
+    const d = await teslaFetch(`/api/1/vehicles/${id}/vehicle_data`);
+    const r = d.response || {};
+    const c = r.charge_state || {};
+    const dr = r.drive_state || {};
+    const vs = r.vehicle_state || {};
+    const cl = r.climate_state || {};
+    const cfg = r.vehicle_config || {};
+
+
+    const tpms = {
+      fl: vs.tpms_pressure_fl ?? null,
+      fr: vs.tpms_pressure_fr ?? null,
+      rl: vs.tpms_pressure_rl ?? null,
+      rr: vs.tpms_pressure_rr ?? null
+    };
+    const vals = Object.values(tpms).filter(x => typeof x === "number");
+
+
+    res.json({
+      ok: true,
+      connected: true,
+      vehicle: {
+        id,
+        name: v.display_name || vs.vehicle_name || "Tesla",
+        state: v.state || null,
+        carVersion: vs.car_version || null,
+        carType: cfg.car_type || null,
+        wheelType: cfg.wheel_type || null,
+        odometerKm: vs.odometer ? vs.odometer * 1.60934 : null
+      },
+      telemetry: {
+        batteryLevel: c.battery_level ?? null,
+        usableBatteryLevel: c.usable_battery_level ?? null,
+        chargeLimitSoc: c.charge_limit_soc ?? null,
+        idealRangeKm: c.ideal_battery_range ? c.ideal_battery_range * 1.60934 : null,
+        ratedRangeKm: c.battery_range ? c.battery_range * 1.60934 : null,
+        chargingState: c.charging_state ?? null,
+        chargerPowerKw: c.charger_power ?? null,
+        speedKmh: dr.speed != null ? dr.speed * 1.60934 : null,
+        powerKw: dr.power ?? null,
+        latitude: dr.latitude ?? null,
+        longitude: dr.longitude ?? null,
+        shiftState: dr.shift_state ?? null,
+        outsideTemp: cl.outside_temp ?? null,
+        insideTemp: cl.inside_temp ?? null,
+        climateOn: cl.is_climate_on ?? null,
+        tpmsAvgBar: vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null,
+        tpms,
+        tpmsRecommended: {
+          front: vs.tpms_rcp_front_value ?? null,
+          rear: vs.tpms_rcp_rear_value ?? null
+        },
+        timestamp: new Date().toISOString()
+      }
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, connected: false, error: e.message });
+  }
+});
+
+
+app.listen(PORT, () => console.log("Tesla TurOptimal V5 FULL WORKING backend on port " + PORT));
