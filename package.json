@@ -1,9 +1,11 @@
 {
-  "name": "tesla-v4-1-fixed-backend",
-  "version": "4.1.0",
+  "name": "tesla-v5-full-working-backend",
+  "version": "5.0.0",
   "main": "server.js",
   "type": "commonjs",
-  "scripts": {"start": "node server.js"},
+  "scripts": {
+    "start": "node server.js"
+  },
   "dependencies": {
     "express": "^4.18.2",
     "cors": "^2.8.5",
