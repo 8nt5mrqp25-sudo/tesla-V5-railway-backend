@@ -28,13 +28,13 @@ async function safeJson(resp) {
 }
 
 
-app.get("/", (req, res) => res.send("Tesla TurOptimal V5 FULL WORKING backend"));
+app.get("/", (req, res) => res.send("Tesla TurOptimal V5.1 ROUTE-BOUND CHARGING backend"));
 
 
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    version: "5.0-full-working-map-chargers",
+    version: "5.1-route-bound-charging",
     client: !!TESLA_CLIENT_ID,
     secret: !!TESLA_CLIENT_SECRET,
     google: !!GOOGLE_API_KEY,
@@ -311,4 +311,4 @@ app.get("/api/tesla-live", async (req, res) => {
 });
 
 
-app.listen(PORT, () => console.log("Tesla TurOptimal V5 FULL WORKING backend on port " + PORT));
+app.listen(PORT, () => console.log("Tesla TurOptimal V5.1 ROUTE-BOUND CHARGING backend on port " + PORT));
