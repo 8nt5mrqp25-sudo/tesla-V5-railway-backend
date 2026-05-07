@@ -1,6 +1,6 @@
 {
-  "name": "tesla-v5-full-working-backend",
-  "version": "5.0.0",
+  "name": "tesla-v5-1-route-bound-charging-backend",
+  "version": "5.1.0",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
