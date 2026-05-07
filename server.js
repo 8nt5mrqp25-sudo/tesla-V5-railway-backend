@@ -1,5 +1,3 @@
-
-
 const express=require("express"),cors=require("cors"),crypto=require("crypto"),fetch=require("node-fetch");
 const app=express();app.use(express.json({limit:"5mb"}));app.use(cors({origin:true}));
 const PORT=process.env.PORT||8080;
@@ -21,8 +19,6 @@ const sample=(a,m=240)=>!a||a.length<=m?a||[]:Array.from({length:m},(_,i)=>a[Mat
 const pointAt=(poly,total,km)=>poly[Math.max(0,Math.min(poly.length-1,Math.round(km/Math.max(1,total)*(poly.length-1))))]||poly[0];
 const navUrl=stops=>{const o=encodeURIComponent(stops[0]),d=encodeURIComponent(stops.at(-1)),w=stops.slice(1,-1).map(encodeURIComponent).join("|");return`https://www.google.com/maps/dir/?api=1&origin=${o}&destination=${d}&travelmode=driving${w?`&waypoints=${w}`:""}`};
 const mapEmbed=stops=>"https://www.google.com/maps?output=embed&q="+encodeURIComponent((stops||[]).join(" to "));
-
-
 app.get("/",(req,res)=>res.send("Tesla TurOptimal V4 AI Route Energy Engine backend"));
 app.get("/health",(req,res)=>res.json({ok:true,version:"4.0-ai-route-energy-engine",teslaClient:!!CID,teslaSecret:!!CSEC,google:!!GKEY,backendUrl:BACKEND,appUrl:APPURL,endpoints:["/auth/tesla","/api/tesla-live","/api/address-suggest","/api/plan-trip-v4","/api/wake"]}));
 app.get("/auth/login",(req,res)=>res.redirect("/auth/tesla"));
@@ -53,8 +49,6 @@ app.get("/api/tesla-live",async(req,res)=>{try{const v=await firstVehicle(),id=v
  const tpms={fl:vs.tpms_pressure_fl??null,fr:vs.tpms_pressure_fr??null,rl:vs.tpms_pressure_rl??null,rr:vs.tpms_pressure_rr??null},vals=Object.values(tpms).filter(x=>typeof x==="number"),speedKmh=dr.speed!=null?dr.speed*1.60934:null;
  res.json({ok:true,connected:true,vehicle:{id,name:v.display_name||vs.vehicle_name||"Tesla",state:v.state||null,carVersion:vs.car_version||null,carType:cfg.car_type||null,wheelType:cfg.wheel_type||null,odometerKm:vs.odometer?vs.odometer*1.60934:null,trim:cfg.trim_badging||null},telemetry:{batteryLevel:c.battery_level??null,usableBatteryLevel:c.usable_battery_level??null,chargeLimitSoc:c.charge_limit_soc??null,idealRangeKm:c.ideal_battery_range?c.ideal_battery_range*1.60934:null,ratedRangeKm:c.battery_range?c.battery_range*1.60934:null,chargingState:c.charging_state??null,chargerPowerKw:c.charger_power??null,speedKmh,powerKw:dr.power??null,latitude:dr.latitude??null,longitude:dr.longitude??null,shiftState:dr.shift_state??null,outsideTemp:cl.outside_temp??null,insideTemp:cl.inside_temp??null,climateOn:cl.is_climate_on??null,tpmsAvgBar:vals.length?vals.reduce((a,b)=>a+b,0)/vals.length:null,tpms,tpmsRecommended:{front:vs.tpms_rcp_front_value??null,rear:vs.tpms_rcp_rear_value??null},timestamp:new Date().toISOString()}})}catch(e){res.status(500).json({ok:false,connected:false,error:e.message})}});
 app.get("/api/tesla-live-dashboard",(req,res)=>{req.url="/api/tesla-live";app._router.handle(req,res)});
-
-
 app.get("/api/address-suggest",async(req,res)=>{try{if(!GKEY)throw new Error("GOOGLE_API_KEY mangler i Railway");const input=String(req.query.input||"").trim();if(input.length<2)return res.json({ok:true,predictions:[]});
  const r=await fetch("https://maps.googleapis.com/maps/api/place/autocomplete/json?"+new URLSearchParams({input,key:GKEY,language:"no",components:"country:no"}));const d=await r.json();
  if(d.status!=="OK"&&d.status!=="ZERO_RESULTS")throw new Error("Autocomplete feilet: "+d.status);
