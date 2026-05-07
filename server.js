@@ -2,15 +2,21 @@ const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
 const fetch = require("node-fetch");
+
+
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 app.use(cors({ origin: true }));
+
+
 const PORT = process.env.PORT || 8080;
 const TESLA_CLIENT_ID = (process.env.TESLA_CLIENT_ID || "").trim();
 const TESLA_CLIENT_SECRET = (process.env.TESLA_CLIENT_SECRET || "").trim();
 const GOOGLE_API_KEY = (process.env.GOOGLE_API_KEY || "").trim();
 const BACKEND_URL = (process.env.BACKEND_URL || "https://tesla-v5-railway-backend-production.up.railway.app").trim();
 const APP_URL = (process.env.APP_URL || "https://teslaoptimizer.netlify.app").trim();
+
+
 const TESLA_AUTH = "https://auth.tesla.com";
 const TESLA_API = "https://fleet-api.prd.eu.vn.cloud.tesla.com";
 
@@ -32,13 +38,13 @@ async function safeJson(resp) {
 }
 
 
-app.get("/", (req, res) => res.send("Tesla TurOptimal V7.8.2 GOOGLE NAVIGATION SYNC backend"));
+app.get("/", (req, res) => res.send("Tesla TurOptimal V9 PREDICTIVE ENERGY AI backend"));
 
 
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    version: "7.8.2-google-navigation-sync",
+    version: "9.0-predictive-energy-ai",
     client: !!TESLA_CLIENT_ID,
     secret: !!TESLA_CLIENT_SECRET,
     google: !!GOOGLE_API_KEY,
@@ -315,4 +321,4 @@ app.get("/api/tesla-live", async (req, res) => {
 });
 
 
-app.listen(PORT, () => console.log("Tesla TurOptimal V7.8.2 GOOGLE NAVIGATION SYNC backend on port " + PORT));
+app.listen(PORT, () => console.log("Tesla TurOptimal V9 PREDICTIVE ENERGY AI backend on port " + PORT));
