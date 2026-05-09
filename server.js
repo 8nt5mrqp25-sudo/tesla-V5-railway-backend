@@ -38,13 +38,13 @@ async function safeJson(resp) {
 }
 
 
-app.get("/", (req, res) => res.send("Tesla TurOptimal V9.5 TRIP INTELLIGENCE ENGINE backend"));
+app.get("/", (req, res) => res.send("Tesla TurOptimal V10.2 LIVE SUPERCHARGER AVAILABILITY backend"));
 
 
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    version: "9.5-trip-intelligence-engine",
+    version: "10.2-live-supercharger-availability",
     client: !!TESLA_CLIENT_ID,
     secret: !!TESLA_CLIENT_SECRET,
     google: !!GOOGLE_API_KEY,
@@ -321,4 +321,4 @@ app.get("/api/tesla-live", async (req, res) => {
 });
 
 
-app.listen(PORT, () => console.log("Tesla TurOptimal V9.5 TRIP INTELLIGENCE ENGINE backend on port " + PORT));
+app.listen(PORT, () => console.log("Tesla TurOptimal V10.2 LIVE SUPERCHARGER AVAILABILITY backend on port " + PORT));
