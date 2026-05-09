@@ -1,6 +1,7 @@
+
 {
-  "name": "tesla-v9-5-trip-intelligence-engine-backend",
-  "version": "9.5.0",
+  "name": "tesla-v10-2-live-supercharger-availability-backend",
+  "version": "10.2.0",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
