@@ -1,6 +1,6 @@
 {
-  "name": "tesla-v9-predictive-energy-ai-backend",
-  "version": "9.0.0",
+  "name": "tesla-v9-5-trip-intelligence-engine-backend",
+  "version": "9.5.0",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
