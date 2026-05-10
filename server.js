@@ -2,19 +2,29 @@ const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
 const fetch = require("node-fetch");
+
+
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 app.use(cors({ origin: true }));
+
+
 const PORT = process.env.PORT || 8080;
 const TESLA_CLIENT_ID = (process.env.TESLA_CLIENT_ID || "").trim();
 const TESLA_CLIENT_SECRET = (process.env.TESLA_CLIENT_SECRET || "").trim();
 const GOOGLE_API_KEY = (process.env.GOOGLE_API_KEY || "").trim();
 const BACKEND_URL = (process.env.BACKEND_URL || "https://tesla-v5-railway-backend-production.up.railway.app").trim();
 const APP_URL = (process.env.APP_URL || "https://teslaoptimizer.netlify.app").trim();
+
+
 const TESLA_AUTH = "https://auth.tesla.com";
 const TESLA_API = "https://fleet-api.prd.eu.vn.cloud.tesla.com";
+
+
 let savedToken = null;
 const pkceStore = new Map();
+
+
 function b64(buf) {
   return Buffer.from(buf).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
@@ -28,13 +38,13 @@ async function safeJson(resp) {
 }
 
 
-app.get("/", (req, res) => res.send("Tesla TurOptimal V10.4 SMART CHARGE ELIMINATION backend"));
+app.get("/", (req, res) => res.send("Tesla TurOptimal V10.6 PLACES EV METADATA backend"));
 
 
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    version: "10.4-smart-charge-elimination",
+    version: "10.6-places-ev-metadata",
     client: !!TESLA_CLIENT_ID,
     secret: !!TESLA_CLIENT_SECRET,
     google: !!GOOGLE_API_KEY,
@@ -311,4 +321,74 @@ app.get("/api/tesla-live", async (req, res) => {
 });
 
 
-app.listen(PORT, () => console.log("Tesla TurOptimal V10.4 SMART CHARGE ELIMINATION backend on port " + PORT));
+
+
+// ===== V10.6 PLACES API (NEW) EV METADATA PROXY =====
+function simplifyEvOptionsV106(place) {
+  const ev = place.evChargeOptions || {};
+  const aggs = ev.connectorAggregation || [];
+  let total = ev.connectorCount || null;
+  let available = null;
+  let maxKw = null;
+  let connectorTypes = [];
+  if (Array.isArray(aggs)) {
+    let sum = 0, availSum = 0, hasAvail = false;
+    for (const a of aggs) {
+      const count = Number(a.count || 0);
+      if (count) sum += count;
+      if (a.availableCount !== undefined && a.availableCount !== null) {
+        hasAvail = true;
+        availSum += Number(a.availableCount);
+      }
+      const rate = Number(a.maxChargeRateKw || 0);
+      if (rate) maxKw = Math.max(maxKw || 0, rate);
+      if (a.type) connectorTypes.push(String(a.type).replace("EV_CONNECTOR_TYPE_", ""));
+    }
+    if (!total && sum) total = sum;
+    if (hasAvail) available = availSum;
+  }
+  return { available, total, maxKw, connectorTypes: [...new Set(connectorTypes)].filter(Boolean) };
+}
+
+
+app.get("/api/places/ev-search", async (req, res) => {
+  try {
+    const key = process.env.GOOGLE_API_KEY;
+    if (!key) return res.status(500).json({ error: "GOOGLE_API_KEY mangler i Railway" });
+    const q = String(req.query.q || "Tesla Supercharger").slice(0, 200);
+    const lat = Number(req.query.lat), lng = Number(req.query.lng);
+    const body = { textQuery: q, maxResultCount: 5, includedType: "electric_vehicle_charging_station" };
+    if (Number.isFinite(lat) && Number.isFinite(lng)) {
+      body.locationBias = { circle: { center: { latitude: lat, longitude: lng }, radius: Number(req.query.radius || 12000) } };
+    }
+    const r = await fetch("https://places.googleapis.com/v1/places:searchText", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": key,
+        "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.regularOpeningHours,places.businessStatus,places.evChargeOptions,places.googleMapsUri"
+      },
+      body: JSON.stringify(body)
+    });
+    const data = await r.json();
+    if (!r.ok) return res.status(r.status).json({ error: "Google Places feilet", details: data });
+    const places = (data.places || []).map(p => ({
+      id: p.id,
+      name: p.displayName?.text || "",
+      formattedAddress: p.formattedAddress || "",
+      location: p.location || null,
+      rating: p.rating || null,
+      userRatingCount: p.userRatingCount || null,
+      businessStatus: p.businessStatus || null,
+      openNow: p.regularOpeningHours?.openNow ?? null,
+      googleMapsUri: p.googleMapsUri || null,
+      ev: simplifyEvOptionsV106(p)
+    }));
+    res.json({ places });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+
+app.listen(PORT, () => console.log("Tesla TurOptimal V10.6 PLACES EV METADATA backend on port " + PORT));
