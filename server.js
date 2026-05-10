@@ -2,24 +2,29 @@ const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
 const fetch = require("node-fetch");
-﻿
+
+
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 app.use(cors({ origin: true }));
-﻿
+
+
 const PORT = process.env.PORT || 8080;
 const TESLA_CLIENT_ID = (process.env.TESLA_CLIENT_ID || "").trim();
 const TESLA_CLIENT_SECRET = (process.env.TESLA_CLIENT_SECRET || "").trim();
 const GOOGLE_API_KEY = (process.env.GOOGLE_API_KEY || "").trim();
 const BACKEND_URL = (process.env.BACKEND_URL || "https://tesla-v5-railway-backend-production.up.railway.app").trim();
 const APP_URL = (process.env.APP_URL || "https://teslaoptimizer.netlify.app").trim();
-﻿
+
+
 const TESLA_AUTH = "https://auth.tesla.com";
 const TESLA_API = "https://fleet-api.prd.eu.vn.cloud.tesla.com";
-﻿
+
+
 let savedToken = null;
 const pkceStore = new Map();
-﻿
+
+
 function b64(buf) {
   return Buffer.from(buf).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
@@ -31,13 +36,15 @@ async function safeJson(resp) {
   try { return { json: JSON.parse(raw), raw }; }
   catch { return { json: null, raw }; }
 }
-﻿
-app.get("/", (req, res) => res.send("Tesla TurOptimal V10.7 EV METADATA DISPLAY FIX backend"));
-﻿
+
+
+app.get("/", (req, res) => res.send("Tesla TurOptimal V10.8 BACKEND URL FIX backend"));
+
+
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    version: "10.7-ev-metadata-display-fix",
+    version: "10.8-backend-url-fix",
     client: !!TESLA_CLIENT_ID,
     secret: !!TESLA_CLIENT_SECRET,
     google: !!GOOGLE_API_KEY,
@@ -52,7 +59,8 @@ app.get("/health", (req, res) => {
     ]
   });
 });
-﻿
+
+
 app.get("/api/google-key", (req, res) => {
   res.json({
     ok: !!GOOGLE_API_KEY,
@@ -60,18 +68,22 @@ app.get("/api/google-key", (req, res) => {
     keyPrefix: GOOGLE_API_KEY ? GOOGLE_API_KEY.slice(0, 8) + "..." : null
   });
 });
-﻿
+
+
 app.get("/api/test-google", async (req, res) => {
   try {
     if (!GOOGLE_API_KEY) throw new Error("GOOGLE_API_KEY mangler i Railway");
     const input = String(req.query.input || "Kongsberg").trim();
-﻿
+
+
     const url = "https://maps.googleapis.com/maps/api/place/autocomplete/json?" +
       new URLSearchParams({ input, key: GOOGLE_API_KEY, language: "no", components: "country:no" });
-﻿
+
+
     const r = await fetch(url);
     const data = await r.json();
-﻿
+
+
     res.json({
       ok: data.status === "OK" || data.status === "ZERO_RESULTS",
       googleStatus: data.status,
@@ -83,18 +95,22 @@ app.get("/api/test-google", async (req, res) => {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
-﻿
+
+
 app.get("/auth/login", (req, res) => res.redirect("/auth/tesla"));
 app.get("/api/login", (req, res) => res.redirect("/auth/tesla"));
-﻿
+
+
 app.get("/auth/tesla", (req, res) => {
   if (!TESLA_CLIENT_ID) return res.status(500).send("TESLA_CLIENT_ID mangler i Railway Variables");
-﻿
+
+
   const state = crypto.randomBytes(16).toString("hex");
   const verifier = b64(crypto.randomBytes(64));
   const challenge = sha256(verifier);
   pkceStore.set(state, verifier);
-﻿
+
+
   const params = new URLSearchParams({
     client_id: TESLA_CLIENT_ID,
     response_type: "code",
@@ -104,17 +120,20 @@ app.get("/auth/tesla", (req, res) => {
     code_challenge: challenge,
     code_challenge_method: "S256"
   });
-﻿
+
+
   res.redirect(`${TESLA_AUTH}/oauth2/v3/authorize?${params.toString()}`);
 });
-﻿
+
+
 app.get("/auth/callback", async (req, res) => {
   try {
     const { code, state } = req.query;
     const verifier = pkceStore.get(String(state || ""));
     if (!code || !verifier) return res.status(400).send("Mangler code eller utløpt state. Start /auth/tesla igjen.");
     pkceStore.delete(String(state));
-﻿
+
+
     const body = new URLSearchParams({
       grant_type: "authorization_code",
       client_id: TESLA_CLIENT_ID,
@@ -123,7 +142,8 @@ app.get("/auth/callback", async (req, res) => {
       redirect_uri: `${BACKEND_URL}/auth/callback`,
       code_verifier: verifier
     });
-﻿
+
+
     const r = await fetch(`${TESLA_AUTH}/oauth2/v3/token`, {
       method: "POST",
       headers: {
@@ -133,35 +153,42 @@ app.get("/auth/callback", async (req, res) => {
       },
       body
     });
-﻿
+
+
     const { json, raw } = await safeJson(r);
     if (!json) return res.status(500).send(raw.slice(0, 1200));
     if (!r.ok) return res.status(500).json({ ok: false, error: "Tesla token-feil", details: json });
-﻿
+
+
     savedToken = {
       access_token: json.access_token,
       refresh_token: json.refresh_token,
       expires_at: Date.now() + (json.expires_in || 3600) * 1000
     };
-﻿
+
+
     res.redirect(`${APP_URL}?tesla=connected`);
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
-﻿
+
+
 async function getTeslaToken() {
   if (!savedToken) throw new Error("Tesla er ikke koblet. Åpne /auth/tesla først.");
-﻿
+
+
   if (Date.now() < savedToken.expires_at - 120000) return savedToken.access_token;
-﻿
+
+
   const body = new URLSearchParams({
     grant_type: "refresh_token",
     client_id: TESLA_CLIENT_ID,
     client_secret: TESLA_CLIENT_SECRET,
     refresh_token: savedToken.refresh_token
   });
-﻿
+
+
   const r = await fetch(`${TESLA_AUTH}/oauth2/v3/token`, {
     method: "POST",
     headers: {
@@ -171,20 +198,24 @@ async function getTeslaToken() {
     },
     body
   });
-﻿
+
+
   const { json, raw } = await safeJson(r);
   if (!json) throw new Error(raw.slice(0, 900));
   if (!r.ok) throw new Error(JSON.stringify(json));
-﻿
+
+
   savedToken = {
     access_token: json.access_token,
     refresh_token: json.refresh_token || savedToken.refresh_token,
     expires_at: Date.now() + (json.expires_in || 3600) * 1000
   };
-﻿
+
+
   return savedToken.access_token;
 }
-﻿
+
+
 async function teslaFetch(path, opt = {}) {
   const token = await getTeslaToken();
   const r = await fetch(`${TESLA_API}${path}`, {
@@ -196,20 +227,23 @@ async function teslaFetch(path, opt = {}) {
       ...(opt.headers || {})
     }
   });
-﻿
+
+
   const { json, raw } = await safeJson(r);
   if (!json) throw new Error(raw.slice(0, 900));
   if (!r.ok) throw new Error(JSON.stringify(json));
   return json;
 }
-﻿
+
+
 async function firstVehicle() {
   const d = await teslaFetch("/api/1/vehicles");
   const v = d.response && d.response[0];
   if (!v) throw new Error("Fant ingen Tesla");
   return v;
 }
-﻿
+
+
 app.post("/api/wake", async (req, res) => {
   try {
     const v = await firstVehicle();
@@ -220,7 +254,8 @@ app.post("/api/wake", async (req, res) => {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
-﻿
+
+
 app.get("/api/tesla-live", async (req, res) => {
   try {
     const v = await firstVehicle();
@@ -232,7 +267,8 @@ app.get("/api/tesla-live", async (req, res) => {
     const vs = r.vehicle_state || {};
     const cl = r.climate_state || {};
     const cfg = r.vehicle_config || {};
-﻿
+
+
     const tpms = {
       fl: vs.tpms_pressure_fl ?? null,
       fr: vs.tpms_pressure_fr ?? null,
@@ -240,7 +276,8 @@ app.get("/api/tesla-live", async (req, res) => {
       rr: vs.tpms_pressure_rr ?? null
     };
     const vals = Object.values(tpms).filter(x => typeof x === "number");
-﻿
+
+
     res.json({
       ok: true,
       connected: true,
@@ -282,8 +319,10 @@ app.get("/api/tesla-live", async (req, res) => {
     res.status(500).json({ ok: false, connected: false, error: e.message });
   }
 });
-﻿
-﻿
+
+
+
+
 // ===== V10.6 PLACES API (NEW) EV METADATA PROXY =====
 function simplifyEvOptionsV106(place) {
   const ev = place.evChargeOptions || {};
@@ -310,7 +349,8 @@ function simplifyEvOptionsV106(place) {
   }
   return { available, total, maxKw, connectorTypes: [...new Set(connectorTypes)].filter(Boolean) };
 }
-﻿
+
+
 app.get("/api/places/ev-search", async (req, res) => {
   try {
     const key = process.env.GOOGLE_API_KEY;
@@ -349,5 +389,6 @@ app.get("/api/places/ev-search", async (req, res) => {
     res.status(500).json({ error: String(err.message || err) });
   }
 });
-﻿
-app.listen(PORT, () => console.log("Tesla TurOptimal V10.7 EV METADATA DISPLAY FIX backend on port " + PORT));
+
+
+app.listen(PORT, () => console.log("Tesla TurOptimal V10.8 BACKEND URL FIX backend on port " + PORT));
