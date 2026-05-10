@@ -2,29 +2,19 @@ const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
 const fetch = require("node-fetch");
-
-
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 app.use(cors({ origin: true }));
-
-
 const PORT = process.env.PORT || 8080;
 const TESLA_CLIENT_ID = (process.env.TESLA_CLIENT_ID || "").trim();
 const TESLA_CLIENT_SECRET = (process.env.TESLA_CLIENT_SECRET || "").trim();
 const GOOGLE_API_KEY = (process.env.GOOGLE_API_KEY || "").trim();
 const BACKEND_URL = (process.env.BACKEND_URL || "https://tesla-v5-railway-backend-production.up.railway.app").trim();
 const APP_URL = (process.env.APP_URL || "https://teslaoptimizer.netlify.app").trim();
-
-
 const TESLA_AUTH = "https://auth.tesla.com";
 const TESLA_API = "https://fleet-api.prd.eu.vn.cloud.tesla.com";
-
-
 let savedToken = null;
 const pkceStore = new Map();
-
-
 function b64(buf) {
   return Buffer.from(buf).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
@@ -38,13 +28,13 @@ async function safeJson(resp) {
 }
 
 
-app.get("/", (req, res) => res.send("Tesla TurOptimal V10.3 SUPERCHARGER FULL ADDRESS backend"));
+app.get("/", (req, res) => res.send("Tesla TurOptimal V10.4 SMART CHARGE ELIMINATION backend"));
 
 
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    version: "10.3-supercharger-full-address",
+    version: "10.4-smart-charge-elimination",
     client: !!TESLA_CLIENT_ID,
     secret: !!TESLA_CLIENT_SECRET,
     google: !!GOOGLE_API_KEY,
@@ -321,4 +311,4 @@ app.get("/api/tesla-live", async (req, res) => {
 });
 
 
-app.listen(PORT, () => console.log("Tesla TurOptimal V10.3 SUPERCHARGER FULL ADDRESS backend on port " + PORT));
+app.listen(PORT, () => console.log("Tesla TurOptimal V10.4 SMART CHARGE ELIMINATION backend on port " + PORT));
