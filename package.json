@@ -1,6 +1,6 @@
 {
-  "name": "tesla-v10-8-backend-url-fix-backend",
-  "version": "10.8.0",
+  "name": "tesla-v11-live-charger-watch-backend",
+  "version": "11.0.0",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
