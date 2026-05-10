@@ -1,6 +1,6 @@
 {
-  "name": "tesla-v10-4-smart-charge-elimination-backend",
-  "version": "10.4.0",
+  "name": "tesla-v10-6-places-ev-metadata-backend",
+  "version": "10.6.0",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
