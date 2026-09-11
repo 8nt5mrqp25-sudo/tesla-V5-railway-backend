@@ -15,6 +15,7 @@ const TESLA_CLIENT_SECRET = (process.env.TESLA_CLIENT_SECRET || "").trim();
 const GOOGLE_API_KEY = (process.env.GOOGLE_API_KEY || "").trim();
 const BACKEND_URL = (process.env.BACKEND_URL || "https://tesla-v5-railway-backend-production.up.railway.app").trim();
 const APP_URL = (process.env.APP_URL || "https://teslaoptimizer.netlify.app").trim();
+const BILFORDELING_APP_URL = (process.env.BILFORDELING_APP_URL || "https://bilfordeling-aage.age-sonstebo.chatgpt.site").trim().replace(/\/$/, "");
 const SUPABASE_URL = (process.env.SUPABASE_URL || "").trim().replace(/\/$/, "");
 const SUPABASE_SERVICE_ROLE_KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
 const TOKEN_ENCRYPTION_KEY = (process.env.TOKEN_ENCRYPTION_KEY || TESLA_CLIENT_SECRET).trim();
@@ -150,13 +151,13 @@ async function loadTeslaToken() {
 }
 
 
-app.get("/", (req, res) => res.send("Bilfordeling Tesla backend v13"));
+app.get("/", (req, res) => res.send("Bilfordeling Tesla backend v14"));
 
 
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    version: "13.0-adaptive-trip-tracker",
+    version: "14.0-private-bilfordeling-api",
     client: !!TESLA_CLIENT_ID,
     secret: !!TESLA_CLIENT_SECRET,
     google: !!GOOGLE_API_KEY,
@@ -176,6 +177,8 @@ app.get("/health", (req, res) => {
     endpoints: [
       "/auth/tesla",
       "/api/tesla-live",
+      "/api/bilfordeling/status",
+      "/api/bilfordeling/trips",
       "/api/wake",
       "/api/google-key",
       "/api/test-google"
@@ -498,6 +501,78 @@ function scheduleTracker(delayMs) {
   trackerTimer = setTimeout(runTrackerTick, delayMs);
 }
 
+function requireBilfordelingOrigin(req, res, next) {
+  const origin = String(req.get("origin") || "").replace(/\/$/, "");
+  const referer = String(req.get("referer") || "");
+  if (origin === BILFORDELING_APP_URL || referer.startsWith(`${BILFORDELING_APP_URL}/`)) {
+    return next();
+  }
+  return res.status(403).json({ ok: false, error: "Kun tilgjengelig fra Bilfordeling-appen" });
+}
+
+function monthRange(month) {
+  if (!/^\d{4}-\d{2}$/.test(month)) throw new Error("Ugyldig måned");
+  const [year, monthNumber] = month.split("-").map(Number);
+  if (monthNumber < 1 || monthNumber > 12) throw new Error("Ugyldig måned");
+  const start = new Date(Date.UTC(year, monthNumber - 1, 1));
+  const end = new Date(Date.UTC(year, monthNumber, 1));
+  return { start: start.toISOString(), end: end.toISOString() };
+}
+
+app.get("/api/bilfordeling/status", requireBilfordelingOrigin, async (req, res) => {
+  try {
+    const state = await loadTrackerState();
+    res.json({
+      ok: true,
+      tracker: {
+        enabled: TRACKER_ENABLED,
+        activeTrip: !!state.activeTripId,
+        activeDriver: state.activeDriver || null,
+        lastObservedAt: state.lastObservedAt || null,
+        lastHome: state.lastHome || null
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.get("/api/bilfordeling/trips", requireBilfordelingOrigin, async (req, res) => {
+  try {
+    const month = String(req.query.month || "");
+    const { start, end } = monthRange(month);
+    const rows = await supabaseRequest(
+      `bf_trips?started_at=gte.${encodeURIComponent(start)}` +
+      `&started_at=lt.${encodeURIComponent(end)}` +
+      "&select=id,started_at,ended_at,driver,distance_km,detection" +
+      "&order=started_at.desc"
+    );
+    res.json({ ok: true, trips: Array.isArray(rows) ? rows : [] });
+  } catch (error) {
+    res.status(400).json({ ok: false, error: error.message });
+  }
+});
+
+app.patch("/api/bilfordeling/trips/:id", requireBilfordelingOrigin, async (req, res) => {
+  try {
+    const id = String(req.params.id || "");
+    const driver = String(req.body?.driver || "");
+    if (!/^\d+$/.test(id)) throw new Error("Ugyldig tur");
+    const drivers = await configuredDrivers();
+    if (!drivers.some(item => item.name === driver)) throw new Error("Ugyldig fører");
+    const rows = await supabaseRequest(`bf_trips?id=eq.${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify({ driver })
+    });
+    const trip = Array.isArray(rows) ? rows[0] : rows;
+    if (!trip) return res.status(404).json({ ok: false, error: "Turen ble ikke funnet" });
+    res.json({ ok: true, trip });
+  } catch (error) {
+    res.status(400).json({ ok: false, error: error.message });
+  }
+});
+
 async function runTrackerTick() {
   if (!TRACKER_ENABLED || trackerRunning) return;
   trackerRunning = true;
@@ -725,6 +800,6 @@ app.get("/api/places/ev-search", async (req, res) => {
 
 
 app.listen(PORT, () => {
-  console.log("Bilfordeling Tesla backend v13 on port " + PORT);
+  console.log("Bilfordeling Tesla backend v14 on port " + PORT);
   if (TRACKER_ENABLED) scheduleTracker(15000);
 });
