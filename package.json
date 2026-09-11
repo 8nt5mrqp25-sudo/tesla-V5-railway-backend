@@ -1,6 +1,6 @@
 {
-  "name": "tesla-v11-live-charger-watch-backend",
-  "version": "11.0.0",
+  "name": "bilfordeling-tesla-backend",
+  "version": "12.0.0",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {

@@ -15,6 +15,9 @@ const TESLA_CLIENT_SECRET = (process.env.TESLA_CLIENT_SECRET || "").trim();
 const GOOGLE_API_KEY = (process.env.GOOGLE_API_KEY || "").trim();
 const BACKEND_URL = (process.env.BACKEND_URL || "https://tesla-v5-railway-backend-production.up.railway.app").trim();
 const APP_URL = (process.env.APP_URL || "https://teslaoptimizer.netlify.app").trim();
+const SUPABASE_URL = (process.env.SUPABASE_URL || "").trim().replace(/\/$/, "");
+const SUPABASE_SERVICE_ROLE_KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
+const TOKEN_ENCRYPTION_KEY = (process.env.TOKEN_ENCRYPTION_KEY || TESLA_CLIENT_SECRET).trim();
 
 
 const TESLA_AUTH = "https://auth.tesla.com";
@@ -22,6 +25,7 @@ const TESLA_API = "https://fleet-api.prd.eu.vn.cloud.tesla.com";
 
 
 let savedToken = null;
+let tokenLoadPromise = null;
 const pkceStore = new Map();
 
 
@@ -37,17 +41,111 @@ async function safeJson(resp) {
   catch { return { json: null, raw }; }
 }
 
+function tokenCryptoKey() {
+  if (!TOKEN_ENCRYPTION_KEY) throw new Error("TOKEN_ENCRYPTION_KEY eller TESLA_CLIENT_SECRET mangler");
+  return crypto.createHash("sha256").update(TOKEN_ENCRYPTION_KEY).digest();
+}
 
-app.get("/", (req, res) => res.send("Tesla TurOptimal V11 LIVE CHARGER WATCH backend"));
+function encryptToken(token) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", tokenCryptoKey(), iv);
+  const ciphertext = Buffer.concat([
+    cipher.update(JSON.stringify(token), "utf8"),
+    cipher.final()
+  ]);
+  const tag = cipher.getAuthTag();
+  return [iv, tag, ciphertext].map(x => x.toString("base64url")).join(".");
+}
+
+function decryptToken(payload) {
+  const [ivRaw, tagRaw, dataRaw] = String(payload || "").split(".");
+  if (!ivRaw || !tagRaw || !dataRaw) throw new Error("Ugyldig lagret Tesla-token");
+  const decipher = crypto.createDecipheriv(
+    "aes-256-gcm",
+    tokenCryptoKey(),
+    Buffer.from(ivRaw, "base64url")
+  );
+  decipher.setAuthTag(Buffer.from(tagRaw, "base64url"));
+  const clear = Buffer.concat([
+    decipher.update(Buffer.from(dataRaw, "base64url")),
+    decipher.final()
+  ]).toString("utf8");
+  return JSON.parse(clear);
+}
+
+async function supabaseRequest(path, options = {}) {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    throw new Error("Supabase er ikke konfigurert i Railway");
+  }
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+    ...options,
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/json",
+      ...(options.headers || {})
+    }
+  });
+  const { json, raw } = await safeJson(response);
+  if (!response.ok) throw new Error(`Supabase ${response.status}: ${raw.slice(0, 900)}`);
+  return json;
+}
+
+async function persistTeslaToken() {
+  if (!savedToken || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return;
+  await supabaseRequest("bf_oauth_tokens?on_conflict=id", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify({
+      id: "tesla",
+      encrypted_payload: encryptToken(savedToken),
+      updated_at: new Date().toISOString()
+    })
+  });
+}
+
+async function loadTeslaToken() {
+  if (savedToken) return savedToken;
+  if (!tokenLoadPromise) {
+    tokenLoadPromise = (async () => {
+      if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
+        try {
+          const rows = await supabaseRequest(
+            "bf_oauth_tokens?id=eq.tesla&select=encrypted_payload&limit=1"
+          );
+          if (Array.isArray(rows) && rows[0]?.encrypted_payload) {
+            savedToken = decryptToken(rows[0].encrypted_payload);
+            return savedToken;
+          }
+        } catch (error) {
+          console.warn("Kunne ikke hente Tesla-token fra Supabase:", error.message);
+        }
+      }
+
+      const refreshToken = (process.env.TESLA_REFRESH_TOKEN || "").trim();
+      if (refreshToken) {
+        savedToken = { access_token: "", refresh_token: refreshToken, expires_at: 0 };
+        return savedToken;
+      }
+      return null;
+    })().finally(() => { tokenLoadPromise = null; });
+  }
+  return tokenLoadPromise;
+}
+
+
+app.get("/", (req, res) => res.send("Bilfordeling Tesla backend v12"));
 
 
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    version: "11.0-live-charger-watch",
+    version: "12.0-supabase-token-store",
     client: !!TESLA_CLIENT_ID,
     secret: !!TESLA_CLIENT_SECRET,
     google: !!GOOGLE_API_KEY,
+    supabase: !!SUPABASE_URL && !!SUPABASE_SERVICE_ROLE_KEY,
+    persistentTeslaToken: !!SUPABASE_URL && !!SUPABASE_SERVICE_ROLE_KEY,
     backendUrl: BACKEND_URL,
     appUrl: APP_URL,
     endpoints: [
@@ -166,6 +264,8 @@ app.get("/auth/callback", async (req, res) => {
       expires_at: Date.now() + (json.expires_in || 3600) * 1000
     };
 
+    await persistTeslaToken();
+
 
     res.redirect(`${APP_URL}?tesla=connected`);
   } catch (e) {
@@ -175,6 +275,7 @@ app.get("/auth/callback", async (req, res) => {
 
 
 async function getTeslaToken() {
+  await loadTeslaToken();
   if (!savedToken) throw new Error("Tesla er ikke koblet. Åpne /auth/tesla først.");
 
 
@@ -210,6 +311,8 @@ async function getTeslaToken() {
     refresh_token: json.refresh_token || savedToken.refresh_token,
     expires_at: Date.now() + (json.expires_in || 3600) * 1000
   };
+
+  await persistTeslaToken();
 
 
   return savedToken.access_token;
@@ -391,4 +494,4 @@ app.get("/api/places/ev-search", async (req, res) => {
 });
 
 
-app.listen(PORT, () => console.log("Tesla TurOptimal V11 LIVE CHARGER WATCH backend on port " + PORT));
+app.listen(PORT, () => console.log("Bilfordeling Tesla backend v12 on port " + PORT));
