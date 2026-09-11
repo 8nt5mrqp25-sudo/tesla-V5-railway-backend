@@ -18,6 +18,11 @@ const APP_URL = (process.env.APP_URL || "https://teslaoptimizer.netlify.app").tr
 const SUPABASE_URL = (process.env.SUPABASE_URL || "").trim().replace(/\/$/, "");
 const SUPABASE_SERVICE_ROLE_KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
 const TOKEN_ENCRYPTION_KEY = (process.env.TOKEN_ENCRYPTION_KEY || TESLA_CLIENT_SECRET).trim();
+const TRACKER_ENABLED = !["0", "false", "off", "no"].includes(
+  String(process.env.TRACKER_ENABLED || "true").trim().toLowerCase()
+);
+const TRACKER_PARKED_MS = Math.max(60000, Number(process.env.TRACKER_PARKED_MS || 600000));
+const TRACKER_ACTIVE_MS = Math.max(30000, Number(process.env.TRACKER_ACTIVE_MS || 60000));
 
 
 const TESLA_AUTH = "https://auth.tesla.com";
@@ -27,6 +32,17 @@ const TESLA_API = "https://fleet-api.prd.eu.vn.cloud.tesla.com";
 let savedToken = null;
 let tokenLoadPromise = null;
 const pkceStore = new Map();
+let cachedVehicle = null;
+let trackerTimer = null;
+let trackerRunning = false;
+const trackerRuntime = {
+  lastPollAt: null,
+  lastSuccessAt: null,
+  lastError: null,
+  activeTrip: false,
+  activeDriver: null,
+  nextPollSeconds: null
+};
 
 
 function b64(buf) {
@@ -134,18 +150,27 @@ async function loadTeslaToken() {
 }
 
 
-app.get("/", (req, res) => res.send("Bilfordeling Tesla backend v12"));
+app.get("/", (req, res) => res.send("Bilfordeling Tesla backend v13"));
 
 
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    version: "12.0-supabase-token-store",
+    version: "13.0-adaptive-trip-tracker",
     client: !!TESLA_CLIENT_ID,
     secret: !!TESLA_CLIENT_SECRET,
     google: !!GOOGLE_API_KEY,
     supabase: !!SUPABASE_URL && !!SUPABASE_SERVICE_ROLE_KEY,
     persistentTeslaToken: !!SUPABASE_URL && !!SUPABASE_SERVICE_ROLE_KEY,
+    tracker: {
+      enabled: TRACKER_ENABLED,
+      activeTrip: trackerRuntime.activeTrip,
+      activeDriver: trackerRuntime.activeDriver,
+      lastPollAt: trackerRuntime.lastPollAt,
+      lastSuccessAt: trackerRuntime.lastSuccessAt,
+      lastError: trackerRuntime.lastError,
+      nextPollSeconds: trackerRuntime.nextPollSeconds
+    },
     backendUrl: BACKEND_URL,
     appUrl: APP_URL,
     endpoints: [
@@ -340,10 +365,215 @@ async function teslaFetch(path, opt = {}) {
 
 
 async function firstVehicle() {
+  if (cachedVehicle) return cachedVehicle;
   const d = await teslaFetch("/api/1/vehicles");
   const v = d.response && d.response[0];
   if (!v) throw new Error("Fant ingen Tesla");
-  return v;
+  cachedVehicle = v;
+  return cachedVehicle;
+}
+
+function haversineMeters(lat1, lon1, lat2, lon2) {
+  const rad = value => value * Math.PI / 180;
+  const dLat = rad(lat2 - lat1);
+  const dLon = rad(lon2 - lon1);
+  const a = Math.sin(dLat / 2) ** 2 +
+    Math.cos(rad(lat1)) * Math.cos(rad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return 6371000 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+async function configuredDrivers() {
+  const rows = await supabaseRequest(
+    "bf_drivers?active=eq.true&select=name,home_address,latitude,longitude,radius_meters"
+  );
+  return Array.isArray(rows) ? rows : [];
+}
+
+function homeAtPosition(drivers, latitude, longitude) {
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return null;
+  const matches = drivers.map(driver => ({
+    ...driver,
+    distanceMeters: haversineMeters(
+      latitude,
+      longitude,
+      Number(driver.latitude),
+      Number(driver.longitude)
+    )
+  })).filter(driver => driver.distanceMeters <= Number(driver.radius_meters || 75));
+  matches.sort((a, b) => a.distanceMeters - b.distanceMeters);
+  return matches[0] || null;
+}
+
+async function loadTrackerState() {
+  const rows = await supabaseRequest(
+    "bf_tracker_state?id=eq.tesla&select=state&limit=1"
+  );
+  return Array.isArray(rows) && rows[0]?.state ? rows[0].state : {};
+}
+
+async function saveTrackerState(state) {
+  await supabaseRequest("bf_tracker_state?on_conflict=id", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify({
+      id: "tesla",
+      state,
+      updated_at: new Date().toISOString()
+    })
+  });
+}
+
+async function createTrip(driver, snapshot, startedAt) {
+  const rows = await supabaseRequest("bf_trips", {
+    method: "POST",
+    headers: { Prefer: "return=representation" },
+    body: JSON.stringify({
+      started_at: startedAt || snapshot.observedAt,
+      driver,
+      start_latitude: snapshot.latitude,
+      start_longitude: snapshot.longitude,
+      start_odometer_km: snapshot.odometerKm,
+      detection: "automatic"
+    })
+  });
+  return Array.isArray(rows) ? rows[0] : rows;
+}
+
+async function closeTrip(id, snapshot, startOdometerKm) {
+  const distanceKm = Number.isFinite(snapshot.odometerKm) && Number.isFinite(startOdometerKm)
+    ? Math.max(0, snapshot.odometerKm - startOdometerKm)
+    : null;
+  const rows = await supabaseRequest(`bf_trips?id=eq.${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { Prefer: "return=representation" },
+    body: JSON.stringify({
+      ended_at: snapshot.observedAt,
+      end_latitude: snapshot.latitude,
+      end_longitude: snapshot.longitude,
+      end_odometer_km: snapshot.odometerKm,
+      distance_km: distanceKm
+    })
+  });
+  return Array.isArray(rows) ? rows[0] : rows;
+}
+
+async function trackerVehicleSnapshot() {
+  const vehicle = await firstVehicle();
+  const id = vehicle.id_s || vehicle.id;
+  const data = await teslaFetch(`/api/1/vehicles/${id}/vehicle_data`);
+  const response = data.response || {};
+  const drive = response.drive_state || {};
+  const vehicleState = response.vehicle_state || {};
+  const latitude = drive.latitude == null ? null : Number(drive.latitude);
+  const longitude = drive.longitude == null ? null : Number(drive.longitude);
+  return {
+    observedAt: new Date().toISOString(),
+    latitude: Number.isFinite(latitude) ? latitude : null,
+    longitude: Number.isFinite(longitude) ? longitude : null,
+    speedKmh: drive.speed == null ? null : Number(drive.speed) * 1.60934,
+    shiftState: drive.shift_state ?? null,
+    odometerKm: vehicleState.odometer == null ? null : Number(vehicleState.odometer) * 1.60934
+  };
+}
+
+function parked(snapshot) {
+  const gearParked = snapshot.shiftState == null || snapshot.shiftState === "P";
+  const speedParked = snapshot.speedKmh == null || snapshot.speedKmh < 1;
+  return gearParked && speedParked;
+}
+
+function previousSnapshot(state) {
+  return {
+    observedAt: state.lastObservedAt || new Date().toISOString(),
+    latitude: Number.isFinite(state.lastLatitude) ? state.lastLatitude : null,
+    longitude: Number.isFinite(state.lastLongitude) ? state.lastLongitude : null,
+    odometerKm: Number.isFinite(state.lastOdometerKm) ? state.lastOdometerKm : null
+  };
+}
+
+function scheduleTracker(delayMs) {
+  if (!TRACKER_ENABLED) return;
+  clearTimeout(trackerTimer);
+  trackerRuntime.nextPollSeconds = Math.round(delayMs / 1000);
+  trackerTimer = setTimeout(runTrackerTick, delayMs);
+}
+
+async function runTrackerTick() {
+  if (!TRACKER_ENABLED || trackerRunning) return;
+  trackerRunning = true;
+  trackerRuntime.lastPollAt = new Date().toISOString();
+  let nextDelay = TRACKER_PARKED_MS;
+
+  try {
+    const [snapshot, drivers, storedState] = await Promise.all([
+      trackerVehicleSnapshot(),
+      configuredDrivers(),
+      loadTrackerState()
+    ]);
+    const state = storedState && typeof storedState === "object" ? storedState : {};
+    const currentHome = homeAtPosition(drivers, snapshot.latitude, snapshot.longitude);
+    let activeTripId = state.activeTripId || null;
+    let activeDriver = state.activeDriver || null;
+    let activeStartOdometerKm = Number.isFinite(state.activeStartOdometerKm)
+      ? state.activeStartOdometerKm
+      : null;
+    const priorHome = state.lastHome || null;
+
+    if (!activeTripId && priorHome && currentHome && currentHome.name !== priorHome) {
+      const start = previousSnapshot(state);
+      const trip = await createTrip(priorHome, start, start.observedAt);
+      activeTripId = trip?.id || null;
+      activeDriver = priorHome;
+      activeStartOdometerKm = start.odometerKm;
+      if (activeTripId) {
+        await closeTrip(activeTripId, snapshot, activeStartOdometerKm);
+        activeTripId = null;
+        activeDriver = null;
+        activeStartOdometerKm = null;
+      }
+    } else if (!activeTripId && priorHome && !currentHome &&
+      Number.isFinite(snapshot.latitude) && Number.isFinite(snapshot.longitude)) {
+      const start = previousSnapshot(state);
+      const trip = await createTrip(priorHome, start, start.observedAt);
+      activeTripId = trip?.id || null;
+      activeDriver = priorHome;
+      activeStartOdometerKm = start.odometerKm;
+    }
+
+    if (activeTripId && currentHome && parked(snapshot)) {
+      await closeTrip(activeTripId, snapshot, activeStartOdometerKm);
+      activeTripId = null;
+      activeDriver = null;
+      activeStartOdometerKm = null;
+    }
+
+    const newState = {
+      ...state,
+      lastObservedAt: snapshot.observedAt,
+      lastLatitude: snapshot.latitude,
+      lastLongitude: snapshot.longitude,
+      lastOdometerKm: snapshot.odometerKm,
+      lastHome: !activeTripId && currentHome ? currentHome.name : priorHome,
+      activeTripId,
+      activeDriver,
+      activeStartOdometerKm,
+      consecutiveFailures: 0
+    };
+    await saveTrackerState(newState);
+
+    trackerRuntime.lastSuccessAt = snapshot.observedAt;
+    trackerRuntime.lastError = null;
+    trackerRuntime.activeTrip = !!activeTripId;
+    trackerRuntime.activeDriver = activeDriver;
+    nextDelay = activeTripId ? TRACKER_ACTIVE_MS : TRACKER_PARKED_MS;
+  } catch (error) {
+    trackerRuntime.lastError = String(error.message || error).slice(0, 240);
+    console.warn("Bilfordeling tracker:", trackerRuntime.lastError);
+    nextDelay = trackerRuntime.activeTrip ? TRACKER_ACTIVE_MS : TRACKER_PARKED_MS;
+  } finally {
+    trackerRunning = false;
+    scheduleTracker(nextDelay);
+  }
 }
 
 
@@ -494,4 +724,7 @@ app.get("/api/places/ev-search", async (req, res) => {
 });
 
 
-app.listen(PORT, () => console.log("Bilfordeling Tesla backend v12 on port " + PORT));
+app.listen(PORT, () => {
+  console.log("Bilfordeling Tesla backend v13 on port " + PORT);
+  if (TRACKER_ENABLED) scheduleTracker(15000);
+});
