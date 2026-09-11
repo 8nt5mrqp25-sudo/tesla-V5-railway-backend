@@ -28,6 +28,7 @@ const TRACKER_ACTIVE_MS = Math.max(30000, Number(process.env.TRACKER_ACTIVE_MS |
 
 const TESLA_AUTH = "https://auth.tesla.com";
 const TESLA_API = "https://fleet-api.prd.eu.vn.cloud.tesla.com";
+const VEHICLE_DATA_ENDPOINTS = "charge_state%3Bclimate_state%3Bdrive_state%3Blocation_data%3Bvehicle_config%3Bvehicle_state";
 
 
 let savedToken = null;
@@ -151,13 +152,13 @@ async function loadTeslaToken() {
 }
 
 
-app.get("/", (req, res) => res.send("Bilfordeling Tesla backend v14"));
+app.get("/", (req, res) => res.send("Bilfordeling Tesla backend v15"));
 
 
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    version: "14.0-private-bilfordeling-api",
+    version: "15.0-location-data",
     client: !!TESLA_CLIENT_ID,
     secret: !!TESLA_CLIENT_SECRET,
     google: !!GOOGLE_API_KEY,
@@ -463,7 +464,7 @@ async function closeTrip(id, snapshot, startOdometerKm) {
 async function trackerVehicleSnapshot() {
   const vehicle = await firstVehicle();
   const id = vehicle.id_s || vehicle.id;
-  const data = await teslaFetch(`/api/1/vehicles/${id}/vehicle_data`);
+  const data = await teslaFetch(`/api/1/vehicles/${id}/vehicle_data?endpoints=${VEHICLE_DATA_ENDPOINTS}`);
   const response = data.response || {};
   const drive = response.drive_state || {};
   const vehicleState = response.vehicle_state || {};
@@ -668,7 +669,7 @@ app.get("/api/tesla-live", async (req, res) => {
   try {
     const v = await firstVehicle();
     const id = v.id_s || v.id;
-    const d = await teslaFetch(`/api/1/vehicles/${id}/vehicle_data`);
+    const d = await teslaFetch(`/api/1/vehicles/${id}/vehicle_data?endpoints=${VEHICLE_DATA_ENDPOINTS}`);
     const r = d.response || {};
     const c = r.charge_state || {};
     const dr = r.drive_state || {};
@@ -800,6 +801,6 @@ app.get("/api/places/ev-search", async (req, res) => {
 
 
 app.listen(PORT, () => {
-  console.log("Bilfordeling Tesla backend v14 on port " + PORT);
+  console.log("Bilfordeling Tesla backend v15 on port " + PORT);
   if (TRACKER_ENABLED) scheduleTracker(15000);
 });
