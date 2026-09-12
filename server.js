@@ -23,7 +23,7 @@ const TRACKER_ENABLED = !["0", "false", "off", "no"].includes(
   String(process.env.TRACKER_ENABLED || "true").trim().toLowerCase()
 );
 const TRACKER_PARKED_MS = Math.max(60000, Number(process.env.TRACKER_PARKED_MS || 600000));
-const TRACKER_ACTIVE_MS = Math.max(30000, Number(process.env.TRACKER_ACTIVE_MS || 60000));
+const TRACKER_ACTIVE_MS = Math.max(30000, Number(process.env.TRACKER_ACTIVE_MS || 30000));
 
 
 const TESLA_AUTH = "https://auth.tesla.com";
@@ -152,13 +152,13 @@ async function loadTeslaToken() {
 }
 
 
-app.get("/", (req, res) => res.send("Bilfordeling Tesla backend v15"));
+app.get("/", (req, res) => res.send("Bilfordeling Tesla backend v16"));
 
 
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    version: "15.0-location-data",
+    version: "16.0-live-trip-progress",
     client: !!TESLA_CLIENT_ID,
     secret: !!TESLA_CLIENT_SECRET,
     google: !!GOOGLE_API_KEY,
@@ -437,15 +437,44 @@ async function createTrip(driver, snapshot, startedAt) {
       start_latitude: snapshot.latitude,
       start_longitude: snapshot.longitude,
       start_odometer_km: snapshot.odometerKm,
+      current_odometer_km: snapshot.odometerKm,
+      current_distance_km: 0,
+      current_speed_kmh: snapshot.speedKmh,
+      max_speed_kmh: Number.isFinite(snapshot.speedKmh) ? snapshot.speedKmh : null,
+      average_speed_kmh: Number.isFinite(snapshot.speedKmh) && snapshot.speedKmh > 1 ? snapshot.speedKmh : null,
       detection: "automatic"
     })
   });
   return Array.isArray(rows) ? rows[0] : rows;
 }
 
-async function closeTrip(id, snapshot, startOdometerKm) {
+async function updateActiveTrip(id, snapshot, startOdometerKm, metrics) {
   const distanceKm = Number.isFinite(snapshot.odometerKm) && Number.isFinite(startOdometerKm)
     ? Math.max(0, snapshot.odometerKm - startOdometerKm)
+    : null;
+  const averageSpeedKmh = metrics.speedSampleCount > 0
+    ? metrics.speedSumKmh / metrics.speedSampleCount
+    : null;
+  await supabaseRequest(`bf_trips?id=eq.${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify({
+      current_odometer_km: snapshot.odometerKm,
+      current_distance_km: distanceKm,
+      current_speed_kmh: snapshot.speedKmh,
+      max_speed_kmh: metrics.maxSpeedKmh,
+      average_speed_kmh: averageSpeedKmh,
+      updated_at: snapshot.observedAt
+    })
+  });
+}
+
+async function closeTrip(id, snapshot, startOdometerKm, metrics = {}) {
+  const distanceKm = Number.isFinite(snapshot.odometerKm) && Number.isFinite(startOdometerKm)
+    ? Math.max(0, snapshot.odometerKm - startOdometerKm)
+    : null;
+  const averageSpeedKmh = Number(metrics.speedSampleCount) > 0
+    ? Number(metrics.speedSumKmh) / Number(metrics.speedSampleCount)
     : null;
   const rows = await supabaseRequest(`bf_trips?id=eq.${encodeURIComponent(id)}`, {
     method: "PATCH",
@@ -455,7 +484,13 @@ async function closeTrip(id, snapshot, startOdometerKm) {
       end_latitude: snapshot.latitude,
       end_longitude: snapshot.longitude,
       end_odometer_km: snapshot.odometerKm,
-      distance_km: distanceKm
+      distance_km: distanceKm,
+      current_odometer_km: snapshot.odometerKm,
+      current_distance_km: distanceKm,
+      current_speed_kmh: 0,
+      max_speed_kmh: Number.isFinite(metrics.maxSpeedKmh) ? metrics.maxSpeedKmh : null,
+      average_speed_kmh: averageSpeedKmh,
+      updated_at: snapshot.observedAt
     })
   });
   return Array.isArray(rows) ? rows[0] : rows;
@@ -529,6 +564,12 @@ app.get("/api/bilfordeling/status", requireBilfordelingOrigin, async (req, res) 
         enabled: TRACKER_ENABLED,
         activeTrip: !!state.activeTripId,
         activeDriver: state.activeDriver || null,
+        activeDistanceKm: Number.isFinite(state.activeDistanceKm) ? state.activeDistanceKm : 0,
+        currentSpeedKmh: Number.isFinite(state.currentSpeedKmh) ? state.currentSpeedKmh : null,
+        maxSpeedKmh: Number.isFinite(state.activeMaxSpeedKmh) ? state.activeMaxSpeedKmh : null,
+        averageSpeedKmh: Number(state.activeSpeedSampleCount) > 0
+          ? Number(state.activeSpeedSumKmh) / Number(state.activeSpeedSampleCount)
+          : null,
         lastObservedAt: state.lastObservedAt || null,
         lastHome: state.lastHome || null
       }
@@ -545,7 +586,7 @@ app.get("/api/bilfordeling/trips", requireBilfordelingOrigin, async (req, res) =
     const rows = await supabaseRequest(
       `bf_trips?started_at=gte.${encodeURIComponent(start)}` +
       `&started_at=lt.${encodeURIComponent(end)}` +
-      "&select=id,started_at,ended_at,driver,distance_km,detection" +
+      "&select=id,started_at,ended_at,driver,distance_km,current_distance_km,current_speed_kmh,max_speed_kmh,average_speed_kmh,detection" +
       "&order=started_at.desc"
     );
     res.json({ ok: true, trips: Array.isArray(rows) ? rows : [] });
@@ -593,6 +634,9 @@ async function runTrackerTick() {
     let activeStartOdometerKm = Number.isFinite(state.activeStartOdometerKm)
       ? state.activeStartOdometerKm
       : null;
+    let activeMaxSpeedKmh = Number.isFinite(state.activeMaxSpeedKmh) ? state.activeMaxSpeedKmh : null;
+    let activeSpeedSumKmh = Number.isFinite(state.activeSpeedSumKmh) ? state.activeSpeedSumKmh : 0;
+    let activeSpeedSampleCount = Number.isFinite(state.activeSpeedSampleCount) ? state.activeSpeedSampleCount : 0;
     const priorHome = state.lastHome || null;
 
     if (!activeTripId && priorHome && currentHome && currentHome.name !== priorHome) {
@@ -601,11 +645,26 @@ async function runTrackerTick() {
       activeTripId = trip?.id || null;
       activeDriver = priorHome;
       activeStartOdometerKm = start.odometerKm;
+      activeMaxSpeedKmh = null;
+      activeSpeedSumKmh = 0;
+      activeSpeedSampleCount = 0;
       if (activeTripId) {
-        await closeTrip(activeTripId, snapshot, activeStartOdometerKm);
+        if (Number.isFinite(snapshot.speedKmh) && snapshot.speedKmh > 1) {
+          activeMaxSpeedKmh = snapshot.speedKmh;
+          activeSpeedSumKmh = snapshot.speedKmh;
+          activeSpeedSampleCount = 1;
+        }
+        await closeTrip(activeTripId, snapshot, activeStartOdometerKm, {
+          maxSpeedKmh: activeMaxSpeedKmh,
+          speedSumKmh: activeSpeedSumKmh,
+          speedSampleCount: activeSpeedSampleCount
+        });
         activeTripId = null;
         activeDriver = null;
         activeStartOdometerKm = null;
+        activeMaxSpeedKmh = null;
+        activeSpeedSumKmh = 0;
+        activeSpeedSampleCount = 0;
       }
     } else if (!activeTripId && priorHome && !currentHome &&
       Number.isFinite(snapshot.latitude) && Number.isFinite(snapshot.longitude)) {
@@ -614,14 +673,40 @@ async function runTrackerTick() {
       activeTripId = trip?.id || null;
       activeDriver = priorHome;
       activeStartOdometerKm = start.odometerKm;
+      activeMaxSpeedKmh = null;
+      activeSpeedSumKmh = 0;
+      activeSpeedSampleCount = 0;
+    }
+
+    if (activeTripId && Number.isFinite(snapshot.speedKmh) && snapshot.speedKmh > 1) {
+      activeMaxSpeedKmh = Math.max(activeMaxSpeedKmh || 0, snapshot.speedKmh);
+      activeSpeedSumKmh += snapshot.speedKmh;
+      activeSpeedSampleCount += 1;
     }
 
     if (activeTripId && currentHome && parked(snapshot)) {
-      await closeTrip(activeTripId, snapshot, activeStartOdometerKm);
+      await closeTrip(activeTripId, snapshot, activeStartOdometerKm, {
+        maxSpeedKmh: activeMaxSpeedKmh,
+        speedSumKmh: activeSpeedSumKmh,
+        speedSampleCount: activeSpeedSampleCount
+      });
       activeTripId = null;
       activeDriver = null;
       activeStartOdometerKm = null;
+      activeMaxSpeedKmh = null;
+      activeSpeedSumKmh = 0;
+      activeSpeedSampleCount = 0;
+    } else if (activeTripId) {
+      await updateActiveTrip(activeTripId, snapshot, activeStartOdometerKm, {
+        maxSpeedKmh: activeMaxSpeedKmh,
+        speedSumKmh: activeSpeedSumKmh,
+        speedSampleCount: activeSpeedSampleCount
+      });
     }
+
+    const activeDistanceKm = activeTripId && Number.isFinite(snapshot.odometerKm) && Number.isFinite(activeStartOdometerKm)
+      ? Math.max(0, snapshot.odometerKm - activeStartOdometerKm)
+      : 0;
 
     const newState = {
       ...state,
@@ -633,6 +718,11 @@ async function runTrackerTick() {
       activeTripId,
       activeDriver,
       activeStartOdometerKm,
+      activeDistanceKm,
+      currentSpeedKmh: activeTripId && Number.isFinite(snapshot.speedKmh) ? snapshot.speedKmh : null,
+      activeMaxSpeedKmh,
+      activeSpeedSumKmh,
+      activeSpeedSampleCount,
       consecutiveFailures: 0
     };
     await saveTrackerState(newState);
