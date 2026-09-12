@@ -43,6 +43,7 @@ const trackerRuntime = {
   lastError: null,
   activeTrip: false,
   activeDriver: null,
+  activeCharging: false,
   nextPollSeconds: null
 };
 
@@ -152,13 +153,13 @@ async function loadTeslaToken() {
 }
 
 
-app.get("/", (req, res) => res.send("Bilfordeling Tesla backend v16"));
+app.get("/", (req, res) => res.send("Bilfordeling Tesla backend v17"));
 
 
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    version: "16.0-live-trip-progress",
+    version: "17.0-trips-and-charging",
     client: !!TESLA_CLIENT_ID,
     secret: !!TESLA_CLIENT_SECRET,
     google: !!GOOGLE_API_KEY,
@@ -168,6 +169,7 @@ app.get("/health", (req, res) => {
       enabled: TRACKER_ENABLED,
       activeTrip: trackerRuntime.activeTrip,
       activeDriver: trackerRuntime.activeDriver,
+      activeCharging: trackerRuntime.activeCharging,
       lastPollAt: trackerRuntime.lastPollAt,
       lastSuccessAt: trackerRuntime.lastSuccessAt,
       lastError: trackerRuntime.lastError,
@@ -180,6 +182,7 @@ app.get("/health", (req, res) => {
       "/api/tesla-live",
       "/api/bilfordeling/status",
       "/api/bilfordeling/trips",
+      "/api/bilfordeling/charging",
       "/api/wake",
       "/api/google-key",
       "/api/test-google"
@@ -496,6 +499,62 @@ async function closeTrip(id, snapshot, startOdometerKm, metrics = {}) {
   return Array.isArray(rows) ? rows[0] : rows;
 }
 
+async function createChargingSession(driver, location, snapshot) {
+  const energyKwh = Number.isFinite(snapshot.chargeEnergyAddedKwh)
+    ? Math.max(0, snapshot.chargeEnergyAddedKwh)
+    : 0;
+  const rows = await supabaseRequest("bf_charging_sessions", {
+    method: "POST",
+    headers: { Prefer: "return=representation" },
+    body: JSON.stringify({
+      started_at: snapshot.observedAt,
+      driver,
+      location,
+      latitude: snapshot.latitude,
+      longitude: snapshot.longitude,
+      start_battery_percent: snapshot.batteryLevel,
+      end_battery_percent: snapshot.batteryLevel,
+      energy_kwh: energyKwh,
+      charger_power_kw: snapshot.chargerPowerKw,
+      charging_type: snapshot.fastChargerPresent ? "Hurtiglading" : "Normallading",
+      status: "charging",
+      detection: "automatic",
+      updated_at: snapshot.observedAt
+    })
+  });
+  return Array.isArray(rows) ? rows[0] : rows;
+}
+
+async function updateChargingSession(id, snapshot, energyKwh) {
+  await supabaseRequest(`bf_charging_sessions?id=eq.${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify({
+      end_battery_percent: snapshot.batteryLevel,
+      energy_kwh: energyKwh,
+      charger_power_kw: snapshot.chargerPowerKw,
+      status: "charging",
+      updated_at: snapshot.observedAt
+    })
+  });
+}
+
+async function closeChargingSession(id, snapshot, energyKwh) {
+  const rows = await supabaseRequest(`bf_charging_sessions?id=eq.${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { Prefer: "return=representation" },
+    body: JSON.stringify({
+      ended_at: snapshot.observedAt,
+      end_battery_percent: snapshot.batteryLevel,
+      energy_kwh: energyKwh,
+      charger_power_kw: 0,
+      status: "complete",
+      updated_at: snapshot.observedAt
+    })
+  });
+  return Array.isArray(rows) ? rows[0] : rows;
+}
+
 async function trackerVehicleSnapshot() {
   const vehicle = await firstVehicle();
   const id = vehicle.id_s || vehicle.id;
@@ -512,6 +571,17 @@ async function trackerVehicleSnapshot() {
     speedKmh: drive.speed == null ? null : Number(drive.speed) * 1.60934,
     shiftState: drive.shift_state ?? null,
     odometerKm: vehicleState.odometer == null ? null : Number(vehicleState.odometer) * 1.60934
+    ,chargingState: response.charge_state?.charging_state ?? null
+    ,chargeEnergyAddedKwh: response.charge_state?.charge_energy_added == null
+      ? null
+      : Number(response.charge_state.charge_energy_added)
+    ,chargerPowerKw: response.charge_state?.charger_power == null
+      ? null
+      : Number(response.charge_state.charger_power)
+    ,batteryLevel: response.charge_state?.battery_level == null
+      ? null
+      : Number(response.charge_state.battery_level)
+    ,fastChargerPresent: Boolean(response.charge_state?.fast_charger_present)
   };
 }
 
@@ -570,6 +640,11 @@ app.get("/api/bilfordeling/status", requireBilfordelingOrigin, async (req, res) 
         averageSpeedKmh: Number(state.activeSpeedSampleCount) > 0
           ? Number(state.activeSpeedSumKmh) / Number(state.activeSpeedSampleCount)
           : null,
+        activeCharging: !!state.activeChargeId,
+        activeChargeDriver: state.activeChargeDriver || null,
+        activeChargeEnergyKwh: Number.isFinite(state.activeChargeEnergyKwh) ? state.activeChargeEnergyKwh : 0,
+        activeChargePowerKw: Number.isFinite(state.activeChargePowerKw) ? state.activeChargePowerKw : null,
+        activeChargeBatteryPercent: Number.isFinite(state.activeChargeBatteryPercent) ? state.activeChargeBatteryPercent : null,
         lastObservedAt: state.lastObservedAt || null,
         lastHome: state.lastHome || null
       }
@@ -615,6 +690,56 @@ app.patch("/api/bilfordeling/trips/:id", requireBilfordelingOrigin, async (req, 
   }
 });
 
+app.get("/api/bilfordeling/charging", requireBilfordelingOrigin, async (req, res) => {
+  try {
+    const month = String(req.query.month || "");
+    const { start, end } = monthRange(month);
+    const rows = await supabaseRequest(
+      `bf_charging_sessions?started_at=gte.${encodeURIComponent(start)}` +
+      `&started_at=lt.${encodeURIComponent(end)}` +
+      "&select=id,started_at,ended_at,driver,location,start_battery_percent,end_battery_percent,energy_kwh,charger_power_kw,charging_type,status,cost_nok,price_nok_per_kwh,detection" +
+      "&order=started_at.desc"
+    );
+    res.json({ ok: true, charging: Array.isArray(rows) ? rows : [] });
+  } catch (error) {
+    res.status(400).json({ ok: false, error: error.message });
+  }
+});
+
+app.patch("/api/bilfordeling/charging/:id", requireBilfordelingOrigin, async (req, res) => {
+  try {
+    const id = String(req.params.id || "");
+    if (!/^[A-Za-z0-9-]+$/.test(id)) throw new Error("Ugyldig ladeøkt");
+    const patch = {};
+    if (req.body?.driver != null) {
+      const driver = String(req.body.driver);
+      const drivers = await configuredDrivers();
+      if (!drivers.some(item => item.name === driver)) throw new Error("Ugyldig fører");
+      patch.driver = driver;
+    }
+    if (req.body?.priceNokPerKwh != null) {
+      const price = Number(req.body.priceNokPerKwh);
+      const energy = Number(req.body.energyKwh);
+      if (!Number.isFinite(price) || price < 0 || !Number.isFinite(energy) || energy < 0) {
+        throw new Error("Ugyldig ladepris");
+      }
+      patch.price_nok_per_kwh = price;
+      patch.cost_nok = price * energy;
+    }
+    patch.updated_at = new Date().toISOString();
+    const rows = await supabaseRequest(`bf_charging_sessions?id=eq.${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify(patch)
+    });
+    const charging = Array.isArray(rows) ? rows[0] : rows;
+    if (!charging) return res.status(404).json({ ok: false, error: "Ladeøkten ble ikke funnet" });
+    res.json({ ok: true, charging });
+  } catch (error) {
+    res.status(400).json({ ok: false, error: error.message });
+  }
+});
+
 async function runTrackerTick() {
   if (!TRACKER_ENABLED || trackerRunning) return;
   trackerRunning = true;
@@ -638,6 +763,9 @@ async function runTrackerTick() {
     let activeSpeedSumKmh = Number.isFinite(state.activeSpeedSumKmh) ? state.activeSpeedSumKmh : 0;
     let activeSpeedSampleCount = Number.isFinite(state.activeSpeedSampleCount) ? state.activeSpeedSampleCount : 0;
     const priorHome = state.lastHome || null;
+    let activeChargeId = state.activeChargeId || null;
+    let activeChargeDriver = state.activeChargeDriver || null;
+    let activeChargeEnergyKwh = Number.isFinite(state.activeChargeEnergyKwh) ? state.activeChargeEnergyKwh : 0;
 
     if (!activeTripId && priorHome && currentHome && currentHome.name !== priorHome) {
       const start = previousSnapshot(state);
@@ -708,6 +836,27 @@ async function runTrackerTick() {
       ? Math.max(0, snapshot.odometerKm - activeStartOdometerKm)
       : 0;
 
+    const isCharging = snapshot.chargingState === "Charging";
+    if (!activeChargeId && isCharging) {
+      activeChargeDriver = activeDriver || currentHome?.name || priorHome || "Ikke fordelt";
+      const location = currentHome?.home_address || "Annet ladested";
+      const charge = await createChargingSession(activeChargeDriver, location, snapshot);
+      activeChargeId = charge?.id || null;
+      activeChargeEnergyKwh = Number.isFinite(snapshot.chargeEnergyAddedKwh)
+        ? Math.max(0, snapshot.chargeEnergyAddedKwh)
+        : 0;
+    } else if (activeChargeId && isCharging) {
+      if (Number.isFinite(snapshot.chargeEnergyAddedKwh)) {
+        activeChargeEnergyKwh = Math.max(activeChargeEnergyKwh, snapshot.chargeEnergyAddedKwh);
+      }
+      await updateChargingSession(activeChargeId, snapshot, activeChargeEnergyKwh);
+    } else if (activeChargeId && !isCharging) {
+      await closeChargingSession(activeChargeId, snapshot, activeChargeEnergyKwh);
+      activeChargeId = null;
+      activeChargeDriver = null;
+      activeChargeEnergyKwh = 0;
+    }
+
     const newState = {
       ...state,
       lastObservedAt: snapshot.observedAt,
@@ -723,6 +872,11 @@ async function runTrackerTick() {
       activeMaxSpeedKmh,
       activeSpeedSumKmh,
       activeSpeedSampleCount,
+      activeChargeId,
+      activeChargeDriver,
+      activeChargeEnergyKwh,
+      activeChargePowerKw: activeChargeId && Number.isFinite(snapshot.chargerPowerKw) ? snapshot.chargerPowerKw : null,
+      activeChargeBatteryPercent: activeChargeId && Number.isFinite(snapshot.batteryLevel) ? snapshot.batteryLevel : null,
       consecutiveFailures: 0
     };
     await saveTrackerState(newState);
@@ -731,11 +885,12 @@ async function runTrackerTick() {
     trackerRuntime.lastError = null;
     trackerRuntime.activeTrip = !!activeTripId;
     trackerRuntime.activeDriver = activeDriver;
-    nextDelay = activeTripId ? TRACKER_ACTIVE_MS : TRACKER_PARKED_MS;
+    trackerRuntime.activeCharging = !!activeChargeId;
+    nextDelay = activeTripId || activeChargeId ? TRACKER_ACTIVE_MS : TRACKER_PARKED_MS;
   } catch (error) {
     trackerRuntime.lastError = String(error.message || error).slice(0, 240);
     console.warn("Bilfordeling tracker:", trackerRuntime.lastError);
-    nextDelay = trackerRuntime.activeTrip ? TRACKER_ACTIVE_MS : TRACKER_PARKED_MS;
+    nextDelay = trackerRuntime.activeTrip || trackerRuntime.activeCharging ? TRACKER_ACTIVE_MS : TRACKER_PARKED_MS;
   } finally {
     trackerRunning = false;
     scheduleTracker(nextDelay);
