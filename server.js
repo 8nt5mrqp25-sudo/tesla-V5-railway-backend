@@ -153,13 +153,13 @@ async function loadTeslaToken() {
 }
 
 
-app.get("/", (req, res) => res.send("Bilfordeling Tesla backend v18"));
+app.get("/", (req, res) => res.send("Bilfordeling Tesla backend v19"));
 
 
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    version: "18.0-trip-deletion",
+    version: "19.0-tesla-charging-history",
     client: !!TESLA_CLIENT_ID,
     secret: !!TESLA_CLIENT_SECRET,
     google: !!GOOGLE_API_KEY,
@@ -183,6 +183,7 @@ app.get("/health", (req, res) => {
       "/api/bilfordeling/status",
       "/api/bilfordeling/trips",
       "/api/bilfordeling/charging",
+      "/api/bilfordeling/tesla-charging-history",
       "/api/wake",
       "/api/google-key",
       "/api/test-google"
@@ -245,7 +246,7 @@ app.get("/auth/tesla", (req, res) => {
     client_id: TESLA_CLIENT_ID,
     response_type: "code",
     redirect_uri: `${BACKEND_URL}/auth/callback`,
-    scope: "openid offline_access vehicle_device_data vehicle_location vehicle_cmds",
+    scope: "openid offline_access vehicle_device_data vehicle_location vehicle_cmds vehicle_charging_cmds",
     state,
     code_challenge: challenge,
     code_challenge_method: "S256"
@@ -732,6 +733,15 @@ app.get("/api/bilfordeling/charging", requireBilfordelingOrigin, async (req, res
   }
 });
 
+app.get("/api/bilfordeling/tesla-charging-history", requireBilfordelingOrigin, async (req, res) => {
+  try {
+    const history = await teslaFetch("/api/1/dx/charging/history");
+    res.json({ ok: true, history: history.response || history });
+  } catch (error) {
+    res.status(400).json({ ok: false, error: error.message });
+  }
+});
+
 app.patch("/api/bilfordeling/charging/:id", requireBilfordelingOrigin, async (req, res) => {
   try {
     const id = String(req.params.id || "");
@@ -1072,6 +1082,6 @@ app.get("/api/places/ev-search", async (req, res) => {
 
 
 app.listen(PORT, () => {
-  console.log("Bilfordeling Tesla backend v18 on port " + PORT);
+  console.log("Bilfordeling Tesla backend v19 on port " + PORT);
   if (TRACKER_ENABLED) scheduleTracker(15000);
 });
