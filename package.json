@@ -1,6 +1,6 @@
 {
   "name": "bilfordeling-tesla-backend",
-  "version": "17.0.0",
+  "version": "18.0.0",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {

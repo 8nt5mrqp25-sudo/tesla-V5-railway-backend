@@ -153,13 +153,13 @@ async function loadTeslaToken() {
 }
 
 
-app.get("/", (req, res) => res.send("Bilfordeling Tesla backend v17"));
+app.get("/", (req, res) => res.send("Bilfordeling Tesla backend v18"));
 
 
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    version: "17.0-trips-and-charging",
+    version: "18.0-trip-deletion",
     client: !!TESLA_CLIENT_ID,
     secret: !!TESLA_CLIENT_SECRET,
     google: !!GOOGLE_API_KEY,
@@ -690,6 +690,32 @@ app.patch("/api/bilfordeling/trips/:id", requireBilfordelingOrigin, async (req, 
   }
 });
 
+app.delete("/api/bilfordeling/trips/:id", requireBilfordelingOrigin, async (req, res) => {
+  try {
+    const id = String(req.params.id || "");
+    if (!/^\d+$/.test(id)) throw new Error("Ugyldig tur");
+
+    const existingRows = await supabaseRequest(
+      `bf_trips?id=eq.${encodeURIComponent(id)}&select=id,ended_at&limit=1`
+    );
+    const existingTrip = Array.isArray(existingRows) ? existingRows[0] : existingRows;
+    if (!existingTrip) return res.status(404).json({ ok: false, error: "Turen ble ikke funnet" });
+    if (!existingTrip.ended_at) {
+      return res.status(409).json({ ok: false, error: "En tur som pågår kan ikke slettes" });
+    }
+
+    const deletedRows = await supabaseRequest(`bf_trips?id=eq.${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      headers: { Prefer: "return=representation" }
+    });
+    const deletedTrip = Array.isArray(deletedRows) ? deletedRows[0] : deletedRows;
+    if (!deletedTrip) return res.status(404).json({ ok: false, error: "Turen ble ikke funnet" });
+    res.json({ ok: true, deletedId: deletedTrip.id });
+  } catch (error) {
+    res.status(400).json({ ok: false, error: error.message });
+  }
+});
+
 app.get("/api/bilfordeling/charging", requireBilfordelingOrigin, async (req, res) => {
   try {
     const month = String(req.query.month || "");
@@ -1046,6 +1072,6 @@ app.get("/api/places/ev-search", async (req, res) => {
 
 
 app.listen(PORT, () => {
-  console.log("Bilfordeling Tesla backend v15 on port " + PORT);
+  console.log("Bilfordeling Tesla backend v18 on port " + PORT);
   if (TRACKER_ENABLED) scheduleTracker(15000);
 });
