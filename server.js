@@ -37,6 +37,8 @@ const pkceStore = new Map();
 let cachedVehicle = null;
 let trackerTimer = null;
 let trackerRunning = false;
+let lastChargingHistorySyncAt = 0;
+let chargingHistorySyncPromise = null;
 const trackerRuntime = {
   lastPollAt: null,
   lastSuccessAt: null,
@@ -153,13 +155,13 @@ async function loadTeslaToken() {
 }
 
 
-app.get("/", (req, res) => res.send("Bilfordeling Tesla backend v19"));
+app.get("/", (req, res) => res.send("Bilfordeling Tesla backend v20"));
 
 
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    version: "19.0-tesla-charging-history",
+    version: "20.0-automatic-supercharging-costs",
     client: !!TESLA_CLIENT_ID,
     secret: !!TESLA_CLIENT_SECRET,
     google: !!GOOGLE_API_KEY,
@@ -556,6 +558,91 @@ async function closeChargingSession(id, snapshot, energyKwh) {
   return Array.isArray(rows) ? rows[0] : rows;
 }
 
+async function driverForChargingTime(startedAt) {
+  const chargeTime = new Date(startedAt);
+  const earliest = new Date(chargeTime.getTime() - 48 * 60 * 60 * 1000).toISOString();
+  const latest = chargeTime.toISOString();
+  const rows = await supabaseRequest(
+    `bf_trips?started_at=gte.${encodeURIComponent(earliest)}` +
+    `&started_at=lte.${encodeURIComponent(latest)}` +
+    "&select=started_at,ended_at,driver&order=started_at.desc"
+  );
+  const trip = (Array.isArray(rows) ? rows : []).find(item => {
+    const start = new Date(item.started_at).getTime();
+    const end = item.ended_at ? new Date(item.ended_at).getTime() : Number.POSITIVE_INFINITY;
+    return start <= chargeTime.getTime() && chargeTime.getTime() <= end;
+  });
+  return trip?.driver || "Ikke fordelt";
+}
+
+async function importTeslaChargingSession(session) {
+  const startedAt = new Date(session.chargeStartDateTime);
+  const endedAt = new Date(session.chargeStopDateTime || session.unlatchDateTime);
+  if (!Number.isFinite(startedAt.getTime()) || !Number.isFinite(endedAt.getTime())) return;
+  if (startedAt < new Date("2026-09-11T00:00:00Z")) return;
+
+  const fees = Array.isArray(session.fees) ? session.fees : [];
+  const chargingFee = fees.find(fee => fee.feeType === "CHARGING" && String(fee.uom || "").toLowerCase() === "kwh");
+  if (!chargingFee) return;
+  const energyKwh = Number(chargingFee.usageBase);
+  const priceNokPerKwh = Number(chargingFee.rateBase);
+  const costNok = fees.reduce((sum, fee) => sum + (Number(fee.totalDue) || 0), 0);
+  if (!Number.isFinite(energyKwh) || !Number.isFinite(costNok)) return;
+
+  const windowStart = new Date(startedAt.getTime() - 30 * 60 * 1000).toISOString();
+  const windowEnd = new Date(startedAt.getTime() + 30 * 60 * 1000).toISOString();
+  const existingRows = await supabaseRequest(
+    `bf_charging_sessions?started_at=gte.${encodeURIComponent(windowStart)}` +
+    `&started_at=lte.${encodeURIComponent(windowEnd)}` +
+    "&select=id,started_at,driver&order=started_at.asc"
+  );
+  const existing = (Array.isArray(existingRows) ? existingRows : [])
+    .sort((a, b) => Math.abs(new Date(a.started_at) - startedAt) - Math.abs(new Date(b.started_at) - startedAt))[0];
+  const driver = existing?.driver && existing.driver !== "Ikke fordelt"
+    ? existing.driver
+    : await driverForChargingTime(startedAt.toISOString());
+  const record = {
+    started_at: startedAt.toISOString(),
+    ended_at: endedAt.toISOString(),
+    driver,
+    location: session.siteLocationName || "Tesla Supercharger",
+    energy_kwh: energyKwh,
+    charging_type: "Superlading",
+    status: "complete",
+    cost_nok: costNok,
+    price_nok_per_kwh: Number.isFinite(priceNokPerKwh) ? priceNokPerKwh : null,
+    detection: "tesla_history",
+    updated_at: new Date().toISOString()
+  };
+
+  if (existing?.id) {
+    await supabaseRequest(`bf_charging_sessions?id=eq.${encodeURIComponent(existing.id)}`, {
+      method: "PATCH",
+      headers: { Prefer: "return=minimal" },
+      body: JSON.stringify(record)
+    });
+  } else {
+    await supabaseRequest("bf_charging_sessions", {
+      method: "POST",
+      headers: { Prefer: "return=minimal" },
+      body: JSON.stringify(record)
+    });
+  }
+}
+
+async function syncTeslaChargingHistory(force = false) {
+  const now = Date.now();
+  if (!force && now - lastChargingHistorySyncAt < 60 * 1000) return;
+  if (chargingHistorySyncPromise) return chargingHistorySyncPromise;
+  chargingHistorySyncPromise = (async () => {
+    const history = await teslaFetch("/api/1/dx/charging/history");
+    const sessions = history?.response?.data || history?.data || [];
+    for (const session of sessions) await importTeslaChargingSession(session);
+    lastChargingHistorySyncAt = Date.now();
+  })().finally(() => { chargingHistorySyncPromise = null; });
+  return chargingHistorySyncPromise;
+}
+
 async function trackerVehicleSnapshot() {
   const vehicle = await firstVehicle();
   const id = vehicle.id_s || vehicle.id;
@@ -719,6 +806,11 @@ app.delete("/api/bilfordeling/trips/:id", requireBilfordelingOrigin, async (req,
 
 app.get("/api/bilfordeling/charging", requireBilfordelingOrigin, async (req, res) => {
   try {
+    try {
+      await syncTeslaChargingHistory();
+    } catch (syncError) {
+      console.warn("Kunne ikke synkronisere Tesla-ladehistorikk:", syncError.message);
+    }
     const month = String(req.query.month || "");
     const { start, end } = monthRange(month);
     const rows = await supabaseRequest(
@@ -1082,6 +1174,6 @@ app.get("/api/places/ev-search", async (req, res) => {
 
 
 app.listen(PORT, () => {
-  console.log("Bilfordeling Tesla backend v19 on port " + PORT);
+  console.log("Bilfordeling Tesla backend v20 on port " + PORT);
   if (TRACKER_ENABLED) scheduleTracker(15000);
 });
