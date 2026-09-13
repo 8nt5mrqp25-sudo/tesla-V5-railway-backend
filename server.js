@@ -24,6 +24,8 @@ const TRACKER_ENABLED = !["0", "false", "off", "no"].includes(
 );
 const TRACKER_PARKED_MS = Math.max(60000, Number(process.env.TRACKER_PARKED_MS || 600000));
 const TRACKER_ACTIVE_MS = Math.max(30000, Number(process.env.TRACKER_ACTIVE_MS || 30000));
+const NVDB_API = "https://nvdbapiles.atlas.vegvesen.no";
+const TOLL_MATCH_RADIUS_METERS = Math.max(30, Number(process.env.TOLL_MATCH_RADIUS_METERS || 90));
 
 
 const TESLA_AUTH = "https://auth.tesla.com";
@@ -39,6 +41,8 @@ let trackerTimer = null;
 let trackerRunning = false;
 let lastChargingHistorySyncAt = 0;
 let chargingHistorySyncPromise = null;
+let tollStationsCache = { loadedAt: 0, stations: [] };
+const roadBearingCache = new Map();
 const trackerRuntime = {
   lastPollAt: null,
   lastSuccessAt: null,
@@ -155,13 +159,13 @@ async function loadTeslaToken() {
 }
 
 
-app.get("/", (req, res) => res.send("Bilfordeling Tesla backend v22"));
+app.get("/", (req, res) => res.send("Bilfordeling Tesla backend v23"));
 
 
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    version: "22.0-persistent-toll-passages",
+    version: "23.0-route-based-toll-detection",
     client: !!TESLA_CLIENT_ID,
     secret: !!TESLA_CLIENT_SECRET,
     google: !!GOOGLE_API_KEY,
@@ -391,6 +395,250 @@ function haversineMeters(lat1, lon1, lat2, lon2) {
   const a = Math.sin(dLat / 2) ** 2 +
     Math.cos(rad(lat1)) * Math.cos(rad(lat2)) * Math.sin(dLon / 2) ** 2;
   return 6371000 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function pointToSegmentMeters(point, start, end) {
+  const referenceLat = (start.latitude + end.latitude + point.latitude) / 3;
+  const metersPerLon = 111320 * Math.cos(referenceLat * Math.PI / 180);
+  const metersPerLat = 110540;
+  const ax = start.longitude * metersPerLon;
+  const ay = start.latitude * metersPerLat;
+  const bx = end.longitude * metersPerLon;
+  const by = end.latitude * metersPerLat;
+  const px = point.longitude * metersPerLon;
+  const py = point.latitude * metersPerLat;
+  const dx = bx - ax;
+  const dy = by - ay;
+  const lengthSquared = dx * dx + dy * dy;
+  const fraction = lengthSquared > 0
+    ? Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / lengthSquared))
+    : 0;
+  return {
+    distance: Math.hypot(px - (ax + fraction * dx), py - (ay + fraction * dy)),
+    fraction
+  };
+}
+
+function propertyValue(object, name) {
+  return object.egenskaper?.find(item => item.navn === name)?.verdi ?? null;
+}
+
+function parseNvdbPoint(wkt) {
+  const match = String(wkt || "").match(/POINT(?: Z)?\s*\(\s*(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)/i);
+  if (!match) return null;
+  // NVDB returns EPSG:4326 point values as latitude, longitude.
+  const latitude = Number(match[1]);
+  const longitude = Number(match[2]);
+  return Number.isFinite(latitude) && Number.isFinite(longitude) ? { latitude, longitude } : null;
+}
+
+function bearingDegrees(start, end) {
+  const lat1 = start.latitude * Math.PI / 180;
+  const lat2 = end.latitude * Math.PI / 180;
+  const deltaLon = (end.longitude - start.longitude) * Math.PI / 180;
+  const y = Math.sin(deltaLon) * Math.cos(lat2);
+  const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(deltaLon);
+  return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+}
+
+function angleDifference(first, second) {
+  return Math.abs(((first - second + 540) % 360) - 180);
+}
+
+function lineEndpoints(wkt) {
+  const pairs = [...String(wkt || "").matchAll(/(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)(?:\s+-?\d+(?:\.\d+)?)?/g)];
+  if (pairs.length < 2) return null;
+  const toPoint = match => ({ latitude: Number(match[1]), longitude: Number(match[2]) });
+  return { start: toPoint(pairs[0]), end: toPoint(pairs[pairs.length - 1]) };
+}
+
+async function stationMatchesDirection(station, start, end) {
+  const rule = station.direction.toLowerCase();
+  if (rule.includes("begge") || !station.roadSequenceId || station.relativePosition == null) return true;
+  const key = `${station.roadSequenceId}:${station.relativePosition}`;
+  let roadBearingPromise = roadBearingCache.get(key);
+  if (!roadBearingPromise) {
+    roadBearingPromise = (async () => {
+      const response = await fetch(
+        `${NVDB_API}/vegnett/veglenkesekvenser/segmentert/${station.roadSequenceId}?srid=4326`,
+        { headers: { "X-Client": "bilfordeling-aage" } }
+      );
+      const { json } = await safeJson(response);
+      if (!response.ok || !Array.isArray(json)) return null;
+      const segment = json.find(item =>
+        Number(item.startposisjon) <= station.relativePosition &&
+        Number(item.sluttposisjon) >= station.relativePosition
+      );
+      const endpoints = lineEndpoints(segment?.geometri?.wkt);
+      return endpoints ? bearingDegrees(endpoints.start, endpoints.end) : null;
+    })();
+    roadBearingCache.set(key, roadBearingPromise);
+  }
+  const roadBearing = await roadBearingPromise;
+  if (!Number.isFinite(roadBearing)) return true;
+  const carBearing = bearingDegrees(start, end);
+  const movingWithMetering = angleDifference(carBearing, roadBearing) <= 90;
+  return rule.includes("med metrering") ? movingWithMetering :
+    rule.includes("mot metrering") ? !movingWithMetering : true;
+}
+
+async function loadTollStations() {
+  if (tollStationsCache.stations.length && Date.now() - tollStationsCache.loadedAt < 6 * 60 * 60 * 1000) {
+    return tollStationsCache.stations;
+  }
+  const response = await fetch(
+    `${NVDB_API}/vegobjekter/45?inkluder=alle&antall=800&srid=4326`,
+    { headers: { "X-Client": "bilfordeling-aage" } }
+  );
+  const { json, raw } = await safeJson(response);
+  if (!response.ok || !json) throw new Error(`NVDB bomstasjoner ${response.status}: ${raw.slice(0, 300)}`);
+  const stations = (json.objekter || []).map(object => {
+    const point = parseNvdbPoint(object.geometri?.wkt || object.lokasjon?.geometri?.wkt);
+    if (!point) return null;
+    const normalTariffValue = propertyValue(object, "Takst liten elbil");
+    const rushTariffValue = propertyValue(object, "Rushtidstakst liten elbil");
+    const normalTariff = normalTariffValue == null ? NaN : Number(normalTariffValue);
+    const rushTariff = rushTariffValue == null ? NaN : Number(rushTariffValue);
+    const roadSegment = object.vegsegmenter?.[0];
+    return {
+      nvdbId: String(object.id),
+      ...point,
+      station: String(propertyValue(object, "Navn bomstasjon") || `Bomstasjon ${object.id}`),
+      company: String(propertyValue(object, "Navn bompengeanlegg") || "Ukjent bompengeanlegg"),
+      direction: String(propertyValue(object, "Innkrevningsretning") || "Ukjent retning"),
+      normalTariff: Number.isFinite(normalTariff) && normalTariff >= 0 ? normalTariff : null,
+      rushTariff: Number.isFinite(rushTariff) && rushTariff >= 0 ? rushTariff : null,
+      rushMorningFrom: propertyValue(object, "Rushtid morgen, fra"),
+      rushMorningTo: propertyValue(object, "Rushtid morgen, til"),
+      rushAfternoonFrom: propertyValue(object, "Rushtid ettermiddag, fra"),
+      rushAfternoonTo: propertyValue(object, "Rushtid ettermiddag, til"),
+      timeRule: String(propertyValue(object, "Timesregel") || ""),
+      timeRuleMinutes: Number(propertyValue(object, "Timesregel, varighet")) || null,
+      timeRuleGroup: propertyValue(object, "Timesregel, passeringsgruppe"),
+      sourceUrl: propertyValue(object, "Lenke til bomstasjon"),
+      priceCheckedAt: object.metadata?.sist_modifisert || object.metadata?.startdato || null
+      ,roadSequenceId: roadSegment?.veglenkesekvensid || null
+      ,relativePosition: roadSegment?.relativPosisjon == null ? null : Number(roadSegment.relativPosisjon)
+    };
+  }).filter(Boolean);
+  tollStationsCache = { loadedAt: Date.now(), stations };
+  return stations;
+}
+
+function osloClock(isoTime) {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Europe/Oslo", hour: "2-digit", minute: "2-digit", hourCycle: "h23"
+  }).formatToParts(new Date(isoTime));
+  const hour = Number(parts.find(part => part.type === "hour")?.value || 0);
+  const minute = Number(parts.find(part => part.type === "minute")?.value || 0);
+  return hour * 60 + minute;
+}
+
+function clockMinutes(value) {
+  const match = String(value || "").match(/^(\d{1,2}):(\d{2})/);
+  return match ? Number(match[1]) * 60 + Number(match[2]) : null;
+}
+
+function stationTariff(station, passedAt) {
+  const minute = osloClock(passedAt);
+  const inWindow = (from, to) => {
+    const start = clockMinutes(from);
+    const end = clockMinutes(to);
+    return start != null && end != null && minute >= start && minute <= end;
+  };
+  const rush = inWindow(station.rushMorningFrom, station.rushMorningTo) ||
+    inWindow(station.rushAfternoonFrom, station.rushAfternoonTo);
+  const amount = rush ? station.rushTariff : station.normalTariff;
+  const checkedTime = station.priceCheckedAt ? new Date(station.priceCheckedAt).getTime() : NaN;
+  const stale = !Number.isFinite(checkedTime) || Date.now() - checkedTime > 370 * 86400000;
+  return {
+    amount,
+    status: amount == null ? "needs_review" : stale ? "stale_review" : "confirmed_nvdb",
+    tariffType: rush ? "rush" : "normal"
+  };
+}
+
+async function applyTimeRule(tripId, station, passedAt, tariff) {
+  if (tariff.amount == null || !station.timeRule.toLowerCase().includes("første passering") ||
+      !station.timeRuleGroup || !station.timeRuleMinutes) return tariff;
+  const windowStart = new Date(new Date(passedAt).getTime() - station.timeRuleMinutes * 60000).toISOString();
+  const rows = await supabaseRequest(
+    `bf_route_toll_passages?trip_id=eq.${encodeURIComponent(tripId)}` +
+    `&time_rule_group=eq.${encodeURIComponent(station.timeRuleGroup)}` +
+    `&passed_at=gte.${encodeURIComponent(windowStart)}` +
+    `&passed_at=lt.${encodeURIComponent(passedAt)}` +
+    "&select=id&limit=1"
+  ).catch(() => []);
+  return Array.isArray(rows) && rows.length
+    ? { ...tariff, amount: 0, status: "confirmed_times_rule" }
+    : tariff;
+}
+
+async function saveTripPoint(tripId, driver, snapshot) {
+  if (!tripId || !Number.isFinite(snapshot.latitude) || !Number.isFinite(snapshot.longitude)) return;
+  await supabaseRequest("bf_trip_points", {
+    method: "POST",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify({
+      trip_id: tripId,
+      driver,
+      observed_at: snapshot.observedAt,
+      latitude: snapshot.latitude,
+      longitude: snapshot.longitude,
+      speed_kmh: snapshot.speedKmh,
+      odometer_km: snapshot.odometerKm
+    })
+  });
+}
+
+async function detectRouteTolls(tripId, driver, previous, snapshot, recent = {}) {
+  if (!tripId || !Number.isFinite(previous.latitude) || !Number.isFinite(previous.longitude) ||
+      !Number.isFinite(snapshot.latitude) || !Number.isFinite(snapshot.longitude)) return recent;
+  const travelled = haversineMeters(previous.latitude, previous.longitude, snapshot.latitude, snapshot.longitude);
+  if (travelled < 5 || travelled > 5000) return recent;
+  const stations = await loadTollStations();
+  const startTime = new Date(previous.observedAt).getTime();
+  const endTime = new Date(snapshot.observedAt).getTime();
+  const nextRecent = { ...recent };
+  for (const station of stations) {
+    const match = pointToSegmentMeters(station, previous, snapshot);
+    if (match.distance > TOLL_MATCH_RADIUS_METERS) continue;
+    if (!(await stationMatchesDirection(station, previous, snapshot))) continue;
+    const passedMs = startTime + Math.max(0, Math.min(1, match.fraction)) * Math.max(0, endTime - startTime);
+    if (passedMs - Number(nextRecent[station.nvdbId] || 0) < 10 * 60 * 1000) continue;
+    const passedAt = new Date(passedMs).toISOString();
+    const tariff = await applyTimeRule(tripId, station, passedAt, stationTariff(station, passedAt));
+    const eventKey = `${tripId}:${station.nvdbId}:${Math.floor(passedMs / 300000)}`;
+    await supabaseRequest("bf_route_toll_passages?on_conflict=event_key", {
+      method: "POST",
+      headers: { Prefer: "resolution=ignore-duplicates,return=minimal" },
+      body: JSON.stringify({
+        event_key: eventKey,
+        trip_id: tripId,
+        nvdb_id: station.nvdbId,
+        passed_at: passedAt,
+        driver,
+        company: station.company,
+        station: station.station,
+        direction: station.direction,
+        latitude: station.latitude,
+        longitude: station.longitude,
+        amount_nok: tariff.amount,
+        tariff_type: tariff.tariffType,
+        price_checked_at: station.priceCheckedAt,
+        price_status: tariff.status,
+        price_source: "Statens vegvesen NVDB",
+        price_source_url: station.sourceUrl,
+        time_rule_group: station.timeRuleGroup == null ? null : String(station.timeRuleGroup),
+        time_rule_minutes: station.timeRuleMinutes,
+        source: "route_nvdb",
+        updated_at: snapshot.observedAt
+      })
+    });
+    nextRecent[station.nvdbId] = passedMs;
+  }
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+  return Object.fromEntries(Object.entries(nextRecent).filter(([, time]) => Number(time) >= cutoff));
 }
 
 async function configuredDrivers() {
@@ -781,6 +1029,14 @@ app.patch("/api/bilfordeling/trips/:id", requireBilfordelingOrigin, async (req, 
     } catch (tollError) {
       console.warn("Kunne ikke oppdatere fører på bompasseringer:", tollError.message);
     }
+    try {
+      await supabaseRequest(`bf_route_toll_passages?trip_id=eq.${encodeURIComponent(id)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ driver, updated_at: new Date().toISOString() })
+      });
+    } catch (routeTollError) {
+      console.warn("Kunne ikke oppdatere fører på rutebaserte bompasseringer:", routeTollError.message);
+    }
     res.json({ ok: true, trip });
   } catch (error) {
     res.status(400).json({ ok: false, error: error.message });
@@ -817,13 +1073,24 @@ app.get("/api/bilfordeling/tolls", requireBilfordelingOrigin, async (req, res) =
   try {
     const month = String(req.query.month || "");
     const { start, end } = monthRange(month);
-    const rows = await supabaseRequest(
+    const importedPromise = supabaseRequest(
       `bf_toll_passages?passed_at=gte.${encodeURIComponent(start)}` +
       `&passed_at=lt.${encodeURIComponent(end)}` +
       "&select=id,trip_id,passed_at,driver,company,station,direction,amount_nok,price_checked_at,price_status,source" +
       "&order=passed_at.asc"
-    );
-    res.json({ ok: true, tolls: Array.isArray(rows) ? rows : [] });
+    ).catch(() => []);
+    const routePromise = supabaseRequest(
+      `bf_route_toll_passages?passed_at=gte.${encodeURIComponent(start)}` +
+      `&passed_at=lt.${encodeURIComponent(end)}` +
+      "&select=id,trip_id,passed_at,driver,company,station,direction,amount_nok,price_checked_at,price_status,source,nvdb_id,tariff_type,price_source_url" +
+      "&order=passed_at.asc"
+    ).catch(() => []);
+    const [importedRows, routeRows] = await Promise.all([importedPromise, routePromise]);
+    const routeTripIds = new Set((routeRows || []).map(item => String(item.trip_id)));
+    const fallbackImported = (importedRows || []).filter(item => !routeTripIds.has(String(item.trip_id)));
+    const tolls = [...(routeRows || []), ...fallbackImported]
+      .sort((a, b) => new Date(a.passed_at) - new Date(b.passed_at));
+    res.json({ ok: true, tolls });
   } catch (error) {
     res.status(400).json({ ok: false, error: error.message });
   }
@@ -974,6 +1241,9 @@ async function runTrackerTick() {
     let activeMaxSpeedKmh = Number.isFinite(state.activeMaxSpeedKmh) ? state.activeMaxSpeedKmh : null;
     let activeSpeedSumKmh = Number.isFinite(state.activeSpeedSumKmh) ? state.activeSpeedSumKmh : 0;
     let activeSpeedSampleCount = Number.isFinite(state.activeSpeedSampleCount) ? state.activeSpeedSampleCount : 0;
+    let recentRouteTolls = state.recentRouteTolls && typeof state.recentRouteTolls === "object"
+      ? state.recentRouteTolls
+      : {};
     const priorHome = state.lastHome || null;
     let activeChargeId = state.activeChargeId || null;
     let activeChargeDriver = state.activeChargeDriver || null;
@@ -988,6 +1258,7 @@ async function runTrackerTick() {
       activeMaxSpeedKmh = null;
       activeSpeedSumKmh = 0;
       activeSpeedSampleCount = 0;
+      recentRouteTolls = {};
       if (activeTripId) {
         if (Number.isFinite(snapshot.speedKmh) && snapshot.speedKmh > 1) {
           activeMaxSpeedKmh = snapshot.speedKmh;
@@ -1016,12 +1287,29 @@ async function runTrackerTick() {
       activeMaxSpeedKmh = null;
       activeSpeedSumKmh = 0;
       activeSpeedSampleCount = 0;
+      recentRouteTolls = {};
     }
 
     if (activeTripId && Number.isFinite(snapshot.speedKmh) && snapshot.speedKmh > 1) {
       activeMaxSpeedKmh = Math.max(activeMaxSpeedKmh || 0, snapshot.speedKmh);
       activeSpeedSumKmh += snapshot.speedKmh;
       activeSpeedSampleCount += 1;
+    }
+
+    if (activeTripId) {
+      const previous = previousSnapshot(state);
+      try {
+        await saveTripPoint(activeTripId, activeDriver, snapshot);
+        recentRouteTolls = await detectRouteTolls(
+          activeTripId,
+          activeDriver,
+          previous,
+          snapshot,
+          recentRouteTolls
+        );
+      } catch (routeError) {
+        console.warn("Kunne ikke lagre rute/bomstasjon:", routeError.message);
+      }
     }
 
     if (activeTripId && currentHome && parked(snapshot)) {
@@ -1084,6 +1372,7 @@ async function runTrackerTick() {
       activeMaxSpeedKmh,
       activeSpeedSumKmh,
       activeSpeedSampleCount,
+      recentRouteTolls: activeTripId ? recentRouteTolls : {},
       activeChargeId,
       activeChargeDriver,
       activeChargeEnergyKwh,
@@ -1258,6 +1547,6 @@ app.get("/api/places/ev-search", async (req, res) => {
 
 
 app.listen(PORT, () => {
-  console.log("Bilfordeling Tesla backend v20 on port " + PORT);
+  console.log("Bilfordeling Tesla backend v23 on port " + PORT);
   if (TRACKER_ENABLED) scheduleTracker(15000);
 });
