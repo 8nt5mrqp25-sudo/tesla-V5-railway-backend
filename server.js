@@ -155,13 +155,13 @@ async function loadTeslaToken() {
 }
 
 
-app.get("/", (req, res) => res.send("Bilfordeling Tesla backend v20"));
+app.get("/", (req, res) => res.send("Bilfordeling Tesla backend v21"));
 
 
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    version: "20.0-automatic-supercharging-costs",
+    version: "21.0-persistent-toll-passages",
     client: !!TESLA_CLIENT_ID,
     secret: !!TESLA_CLIENT_SECRET,
     google: !!GOOGLE_API_KEY,
@@ -184,6 +184,7 @@ app.get("/health", (req, res) => {
       "/api/tesla-live",
       "/api/bilfordeling/status",
       "/api/bilfordeling/trips",
+      "/api/bilfordeling/tolls",
       "/api/bilfordeling/charging",
       "/api/bilfordeling/tesla-charging-history",
       "/api/wake",
@@ -772,6 +773,14 @@ app.patch("/api/bilfordeling/trips/:id", requireBilfordelingOrigin, async (req, 
     });
     const trip = Array.isArray(rows) ? rows[0] : rows;
     if (!trip) return res.status(404).json({ ok: false, error: "Turen ble ikke funnet" });
+    try {
+      await supabaseRequest(`bf_toll_passages?trip_id=eq.${encodeURIComponent(id)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ driver, updated_at: new Date().toISOString() })
+      });
+    } catch (tollError) {
+      console.warn("Kunne ikke oppdatere fører på bompasseringer:", tollError.message);
+    }
     res.json({ ok: true, trip });
   } catch (error) {
     res.status(400).json({ ok: false, error: error.message });
@@ -799,6 +808,81 @@ app.delete("/api/bilfordeling/trips/:id", requireBilfordelingOrigin, async (req,
     const deletedTrip = Array.isArray(deletedRows) ? deletedRows[0] : deletedRows;
     if (!deletedTrip) return res.status(404).json({ ok: false, error: "Turen ble ikke funnet" });
     res.json({ ok: true, deletedId: deletedTrip.id });
+  } catch (error) {
+    res.status(400).json({ ok: false, error: error.message });
+  }
+});
+
+app.get("/api/bilfordeling/tolls", requireBilfordelingOrigin, async (req, res) => {
+  try {
+    const month = String(req.query.month || "");
+    const { start, end } = monthRange(month);
+    const rows = await supabaseRequest(
+      `bf_toll_passages?passed_at=gte.${encodeURIComponent(start)}` +
+      `&passed_at=lt.${encodeURIComponent(end)}` +
+      "&select=id,trip_id,passed_at,driver,company,station,direction,amount_nok,price_checked_at,price_status,source" +
+      "&order=passed_at.asc"
+    );
+    res.json({ ok: true, tolls: Array.isArray(rows) ? rows : [] });
+  } catch (error) {
+    res.status(400).json({ ok: false, error: error.message });
+  }
+});
+
+app.post("/api/bilfordeling/tolls", requireBilfordelingOrigin, async (req, res) => {
+  try {
+    const input = Array.isArray(req.body?.tolls) ? req.body.tolls : [];
+    if (!input.length || input.length > 1000) throw new Error("Ugyldig antall bompasseringer");
+
+    const passages = input.map(item => {
+      const id = String(item.id || "").slice(0, 240);
+      const station = String(item.station || "").trim().slice(0, 240);
+      const passedAt = new Date(item.passedAt || item.date);
+      const amount = item.amountNok == null && item.amount == null ? null : Number(item.amountNok ?? item.amount);
+      if (!id || !station || Number.isNaN(passedAt.getTime())) throw new Error("Ugyldig bompassering");
+      if (amount != null && (!Number.isFinite(amount) || amount < 0)) throw new Error("Ugyldig bompris");
+      return {
+        id,
+        passed_at: passedAt.toISOString(),
+        company: String(item.company || "").trim().slice(0, 240) || null,
+        station,
+        direction: String(item.direction || "").trim().slice(0, 120) || null,
+        amount_nok: amount,
+        price_checked_at: amount == null ? null : passedAt.toISOString(),
+        price_status: amount == null ? "unknown" : "confirmed",
+        source: String(item.source || "skyttelpass").trim().slice(0, 80) || "skyttelpass",
+        updated_at: new Date().toISOString()
+      };
+    });
+
+    const earliest = Math.min(...passages.map(item => new Date(item.passed_at).getTime()));
+    const latest = Math.max(...passages.map(item => new Date(item.passed_at).getTime()));
+    const searchStart = new Date(earliest - 31 * 86400000).toISOString();
+    const searchEnd = new Date(latest + 86400000).toISOString();
+    const tripRows = await supabaseRequest(
+      `bf_trips?started_at=gte.${encodeURIComponent(searchStart)}` +
+      `&started_at=lt.${encodeURIComponent(searchEnd)}` +
+      "&select=id,started_at,ended_at,driver&order=started_at.desc"
+    );
+    const trips = Array.isArray(tripRows) ? tripRows : [];
+
+    passages.forEach(passage => {
+      const time = new Date(passage.passed_at).getTime();
+      const trip = trips.find(item => {
+        const start = new Date(item.started_at).getTime();
+        const end = item.ended_at ? new Date(item.ended_at).getTime() : Date.now();
+        return time >= start && time <= end;
+      });
+      passage.trip_id = trip?.id || null;
+      passage.driver = trip?.driver || null;
+    });
+
+    const rows = await supabaseRequest("bf_toll_passages?on_conflict=id", {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+      body: JSON.stringify(passages)
+    });
+    res.json({ ok: true, tolls: Array.isArray(rows) ? rows : [] });
   } catch (error) {
     res.status(400).json({ ok: false, error: error.message });
   }
