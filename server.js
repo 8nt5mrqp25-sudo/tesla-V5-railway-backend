@@ -155,13 +155,13 @@ async function loadTeslaToken() {
 }
 
 
-app.get("/", (req, res) => res.send("Bilfordeling Tesla backend v21"));
+app.get("/", (req, res) => res.send("Bilfordeling Tesla backend v22"));
 
 
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    version: "21.0-persistent-toll-passages",
+    version: "22.0-persistent-toll-passages",
     client: !!TESLA_CLIENT_ID,
     secret: !!TESLA_CLIENT_SECRET,
     google: !!GOOGLE_API_KEY,
@@ -835,14 +835,14 @@ app.post("/api/bilfordeling/tolls", requireBilfordelingOrigin, async (req, res) 
     if (!input.length || input.length > 1000) throw new Error("Ugyldig antall bompasseringer");
 
     const passages = input.map(item => {
-      const id = String(item.id || "").slice(0, 240);
+      const sourceId = String(item.id || "").slice(0, 240);
       const station = String(item.station || "").trim().slice(0, 240);
       const passedAt = new Date(item.passedAt || item.date);
       const amount = item.amountNok == null && item.amount == null ? null : Number(item.amountNok ?? item.amount);
-      if (!id || !station || Number.isNaN(passedAt.getTime())) throw new Error("Ugyldig bompassering");
+      if (!sourceId || !station || Number.isNaN(passedAt.getTime())) throw new Error("Ugyldig bompassering");
       if (amount != null && (!Number.isFinite(amount) || amount < 0)) throw new Error("Ugyldig bompris");
       return {
-        id,
+        id: Number.parseInt(crypto.createHash("sha256").update(sourceId).digest("hex").slice(0, 13), 16),
         passed_at: passedAt.toISOString(),
         company: String(item.company || "").trim().slice(0, 240) || null,
         station,
