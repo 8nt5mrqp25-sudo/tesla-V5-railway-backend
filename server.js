@@ -16,6 +16,11 @@ const GOOGLE_API_KEY = (process.env.GOOGLE_API_KEY || "").trim();
 const BACKEND_URL = (process.env.BACKEND_URL || "https://tesla-v5-railway-backend-production.up.railway.app").trim();
 const APP_URL = (process.env.APP_URL || "https://teslaoptimizer.netlify.app").trim();
 const BILFORDELING_APP_URL = (process.env.BILFORDELING_APP_URL || "https://bilfordeling-aage.age-sonstebo.chatgpt.site").trim().replace(/\/$/, "");
+const BILFORDELING_ALLOWED_ORIGINS = new Set(
+  [BILFORDELING_APP_URL, APP_URL]
+    .map(value => String(value || "").trim().replace(/\/$/, ""))
+    .filter(Boolean)
+);
 const SUPABASE_URL = (process.env.SUPABASE_URL || "").trim().replace(/\/$/, "");
 const SUPABASE_SERVICE_ROLE_KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
 const TOKEN_ENCRYPTION_KEY = (process.env.TOKEN_ENCRYPTION_KEY || TESLA_CLIENT_SECRET).trim();
@@ -165,7 +170,7 @@ app.get("/", (req, res) => res.send("Bilfordeling Tesla backend v23"));
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    version: "23.0-route-based-toll-detection",
+    version: "23.1-route-tolls-app-origin-fix",
     client: !!TESLA_CLIENT_ID,
     secret: !!TESLA_CLIENT_SECRET,
     google: !!GOOGLE_API_KEY,
@@ -947,7 +952,10 @@ function scheduleTracker(delayMs) {
 function requireBilfordelingOrigin(req, res, next) {
   const origin = String(req.get("origin") || "").replace(/\/$/, "");
   const referer = String(req.get("referer") || "");
-  if (origin === BILFORDELING_APP_URL || referer.startsWith(`${BILFORDELING_APP_URL}/`)) {
+  const allowed = [...BILFORDELING_ALLOWED_ORIGINS].some(appUrl =>
+    origin === appUrl || referer === appUrl || referer.startsWith(`${appUrl}/`)
+  );
+  if (allowed) {
     return next();
   }
   return res.status(403).json({ ok: false, error: "Kun tilgjengelig fra Bilfordeling-appen" });
