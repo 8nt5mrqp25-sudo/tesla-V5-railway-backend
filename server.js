@@ -16,8 +16,13 @@ const GOOGLE_API_KEY = (process.env.GOOGLE_API_KEY || "").trim();
 const BACKEND_URL = (process.env.BACKEND_URL || "https://tesla-v5-railway-backend-production.up.railway.app").trim();
 const APP_URL = (process.env.APP_URL || "https://teslaoptimizer.netlify.app").trim();
 const BILFORDELING_APP_URL = (process.env.BILFORDELING_APP_URL || "https://bilfordeling-aage.age-sonstebo.chatgpt.site").trim().replace(/\/$/, "");
+const BILFORDELING_NETLIFY_URL = (process.env.BILFORDELING_NETLIFY_URL || "https://bilfordeling-aage.netlify.app").trim().replace(/\/$/, "");
+const BILFORDELING_EXTRA_ORIGINS = String(process.env.BILFORDELING_EXTRA_ORIGINS || "")
+  .split(",")
+  .map(value => value.trim().replace(/\/$/, ""))
+  .filter(Boolean);
 const BILFORDELING_ALLOWED_ORIGINS = new Set(
-  [BILFORDELING_APP_URL, APP_URL]
+  [BILFORDELING_APP_URL, BILFORDELING_NETLIFY_URL, ...BILFORDELING_EXTRA_ORIGINS]
     .map(value => String(value || "").trim().replace(/\/$/, ""))
     .filter(Boolean)
 );
@@ -170,7 +175,7 @@ app.get("/", (req, res) => res.send("Bilfordeling Tesla backend v23"));
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    version: "23.1-route-tolls-app-origin-fix",
+    version: "23.3-bilfordeling-netlify",
     client: !!TESLA_CLIENT_ID,
     secret: !!TESLA_CLIENT_SECRET,
     google: !!GOOGLE_API_KEY,
@@ -188,6 +193,7 @@ app.get("/health", (req, res) => {
     },
     backendUrl: BACKEND_URL,
     appUrl: APP_URL,
+    bilfordelingAppUrls: [...BILFORDELING_ALLOWED_ORIGINS],
     endpoints: [
       "/auth/tesla",
       "/api/tesla-live",
@@ -502,8 +508,12 @@ async function loadTollStations() {
     if (!point) return null;
     const normalTariffValue = propertyValue(object, "Takst liten elbil");
     const rushTariffValue = propertyValue(object, "Rushtidstakst liten elbil");
+    const baseNormalTariffValue = propertyValue(object, "Takst liten bil");
+    const baseRushTariffValue = propertyValue(object, "Rushtidstakst liten bil");
     const normalTariff = normalTariffValue == null ? NaN : Number(normalTariffValue);
     const rushTariff = rushTariffValue == null ? NaN : Number(rushTariffValue);
+    const baseNormalTariff = baseNormalTariffValue == null ? NaN : Number(baseNormalTariffValue);
+    const baseRushTariff = baseRushTariffValue == null ? NaN : Number(baseRushTariffValue);
     const roadSegment = object.vegsegmenter?.[0];
     return {
       nvdbId: String(object.id),
@@ -513,6 +523,8 @@ async function loadTollStations() {
       direction: String(propertyValue(object, "Innkrevningsretning") || "Ukjent retning"),
       normalTariff: Number.isFinite(normalTariff) && normalTariff >= 0 ? normalTariff : null,
       rushTariff: Number.isFinite(rushTariff) && rushTariff >= 0 ? rushTariff : null,
+      baseNormalTariff: Number.isFinite(baseNormalTariff) && baseNormalTariff >= 0 ? baseNormalTariff : null,
+      baseRushTariff: Number.isFinite(baseRushTariff) && baseRushTariff >= 0 ? baseRushTariff : null,
       rushMorningFrom: propertyValue(object, "Rushtid morgen, fra"),
       rushMorningTo: propertyValue(object, "Rushtid morgen, til"),
       rushAfternoonFrom: propertyValue(object, "Rushtid ettermiddag, fra"),
@@ -539,6 +551,12 @@ function osloClock(isoTime) {
   return hour * 60 + minute;
 }
 
+function osloWeekday(isoTime) {
+  return new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Europe/Oslo", weekday: "short"
+  }).format(new Date(isoTime));
+}
+
 function clockMinutes(value) {
   const match = String(value || "").match(/^(\d{1,2}):(\d{2})/);
   return match ? Number(match[1]) * 60 + Number(match[2]) : null;
@@ -551,15 +569,31 @@ function stationTariff(station, passedAt) {
     const end = clockMinutes(to);
     return start != null && end != null && minute >= start && minute <= end;
   };
-  const rush = inWindow(station.rushMorningFrom, station.rushMorningTo) ||
-    inWindow(station.rushAfternoonFrom, station.rushAfternoonTo);
-  const amount = rush ? station.rushTariff : station.normalTariff;
+  const weekday = osloWeekday(passedAt);
+  const rushDay = weekday !== "Sat" && weekday !== "Sun";
+  const rush = rushDay && (inWindow(station.rushMorningFrom, station.rushMorningTo) ||
+    inWindow(station.rushAfternoonFrom, station.rushAfternoonTo));
+  let amount = rush ? station.rushTariff : station.normalTariff;
+  let sourceUrl = station.sourceUrl;
+  let derivedFromOfficialRule = false;
+  // NVDB has forelopig bare ordinær lettbiltakst for Bypakke Grenland fase 2.
+  // Offisiell sats for nullutslipp med AutoPASS er 70 % etter 20 % brikkerabatt.
+  if (amount == null && station.company === "Vegfinans Bypakke Grenland AS") {
+    const baseAmount = rush ? station.baseRushTariff : station.baseNormalTariff;
+    if (baseAmount != null) {
+      amount = Math.round(baseAmount * 0.8 * 0.7 * 100) / 100;
+      sourceUrl = "https://www.vegfinans.no/aktuelt/oppstart-av-innkreving-i-bypakke-grenland-fase-2";
+      derivedFromOfficialRule = true;
+    }
+  }
   const checkedTime = station.priceCheckedAt ? new Date(station.priceCheckedAt).getTime() : NaN;
   const stale = !Number.isFinite(checkedTime) || Date.now() - checkedTime > 370 * 86400000;
   return {
     amount,
-    status: amount == null ? "needs_review" : stale ? "stale_review" : "confirmed_nvdb",
-    tariffType: rush ? "rush" : "normal"
+    status: amount == null ? "needs_review" : stale ? "stale_review" :
+      derivedFromOfficialRule ? "confirmed_official_rule" : "confirmed_nvdb",
+    tariffType: rush ? "rush" : "normal",
+    sourceUrl
   };
 }
 
@@ -572,6 +606,7 @@ async function applyTimeRule(tripId, station, passedAt, tariff) {
     `&time_rule_group=eq.${encodeURIComponent(station.timeRuleGroup)}` +
     `&passed_at=gte.${encodeURIComponent(windowStart)}` +
     `&passed_at=lt.${encodeURIComponent(passedAt)}` +
+    "&amount_nok=gt.0" +
     "&select=id&limit=1"
   ).catch(() => []);
   return Array.isArray(rows) && rows.length
@@ -633,7 +668,7 @@ async function detectRouteTolls(tripId, driver, previous, snapshot, recent = {})
         price_checked_at: station.priceCheckedAt,
         price_status: tariff.status,
         price_source: "Statens vegvesen NVDB",
-        price_source_url: station.sourceUrl,
+        price_source_url: tariff.sourceUrl || station.sourceUrl,
         time_rule_group: station.timeRuleGroup == null ? null : String(station.timeRuleGroup),
         time_rule_minutes: station.timeRuleMinutes,
         source: "route_nvdb",
@@ -644,6 +679,64 @@ async function detectRouteTolls(tripId, driver, previous, snapshot, recent = {})
   }
   const cutoff = Date.now() - 24 * 60 * 60 * 1000;
   return Object.fromEntries(Object.entries(nextRecent).filter(([, time]) => Number(time) >= cutoff));
+}
+
+async function reconcileRouteTollPrices(rows) {
+  if (!Array.isArray(rows) || !rows.length) return rows || [];
+  const stations = await loadTollStations();
+  const stationsById = new Map(stations.map(station => [station.nvdbId, station]));
+  const timeRuleAnchors = new Map();
+  const sorted = [...rows].sort((first, second) =>
+    String(first.trip_id).localeCompare(String(second.trip_id), undefined, { numeric: true }) ||
+    new Date(first.passed_at) - new Date(second.passed_at)
+  );
+
+  for (const row of sorted) {
+    const station = stationsById.get(String(row.nvdb_id || ""));
+    if (!station) continue;
+    const passedMs = new Date(row.passed_at).getTime();
+    let tariff = stationTariff(station, row.passed_at);
+    if (station.timeRule.toLowerCase().includes("første passering") &&
+        station.timeRuleGroup && station.timeRuleMinutes && Number.isFinite(passedMs)) {
+      const anchorKey = `${row.trip_id}:${station.timeRuleGroup}`;
+      const anchorMs = timeRuleAnchors.get(anchorKey);
+      if (Number.isFinite(anchorMs) && passedMs - anchorMs < station.timeRuleMinutes * 60000) {
+        tariff = { ...tariff, amount: 0, status: "confirmed_times_rule" };
+      } else {
+        timeRuleAnchors.set(anchorKey, passedMs);
+      }
+    }
+
+    const corrected = {
+      ...row,
+      amount_nok: tariff.amount,
+      tariff_type: tariff.tariffType,
+      price_status: tariff.status,
+      price_checked_at: station.priceCheckedAt,
+      price_source_url: tariff.sourceUrl || station.sourceUrl
+    };
+    const changed = Number(row.amount_nok) !== Number(corrected.amount_nok) ||
+      (row.amount_nok == null) !== (corrected.amount_nok == null) ||
+      row.tariff_type !== corrected.tariff_type ||
+      row.price_status !== corrected.price_status ||
+      row.price_source_url !== corrected.price_source_url;
+    Object.assign(row, corrected);
+    if (changed) {
+      await supabaseRequest(`bf_route_toll_passages?id=eq.${encodeURIComponent(row.id)}`, {
+        method: "PATCH",
+        headers: { Prefer: "return=minimal" },
+        body: JSON.stringify({
+          amount_nok: corrected.amount_nok,
+          tariff_type: corrected.tariff_type,
+          price_status: corrected.price_status,
+          price_checked_at: corrected.price_checked_at,
+          price_source_url: corrected.price_source_url,
+          updated_at: new Date().toISOString()
+        })
+      });
+    }
+  }
+  return rows;
 }
 
 async function configuredDrivers() {
@@ -1094,9 +1187,10 @@ app.get("/api/bilfordeling/tolls", requireBilfordelingOrigin, async (req, res) =
       "&order=passed_at.asc"
     ).catch(() => []);
     const [importedRows, routeRows] = await Promise.all([importedPromise, routePromise]);
-    const routeTripIds = new Set((routeRows || []).map(item => String(item.trip_id)));
+    const pricedRouteRows = await reconcileRouteTollPrices(routeRows || []);
+    const routeTripIds = new Set(pricedRouteRows.map(item => String(item.trip_id)));
     const fallbackImported = (importedRows || []).filter(item => !routeTripIds.has(String(item.trip_id)));
-    const tolls = [...(routeRows || []), ...fallbackImported]
+    const tolls = [...pricedRouteRows, ...fallbackImported]
       .sort((a, b) => new Date(a.passed_at) - new Date(b.passed_at));
     res.json({ ok: true, tolls });
   } catch (error) {
